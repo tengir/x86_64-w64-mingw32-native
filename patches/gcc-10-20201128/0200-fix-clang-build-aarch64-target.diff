@@ -1,0 +1,11 @@
+--- a/gcc/config/aarch64/t-aarch64	2020-11-07 17:48:43.063812000 +0100
++++ b/gcc/config/aarch64/t-aarch64	2020-11-07 17:05:41.287425000 +0100
+@@ -41,7 +41,7 @@ aarch64-builtins.o: $(srcdir)/config/aarch64/aarch64-b
+   $(srcdir)/config/aarch64/aarch64-simd-builtins.def \
+   $(srcdir)/config/aarch64/aarch64-simd-builtin-types.def \
+   aarch64-builtin-iterators.h
+-	$(COMPILER) -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
++	$(COMPILER) -std=gnu++11 -c $(ALL_COMPILERFLAGS) $(ALL_CPPFLAGS) $(INCLUDES) \
+ 		$(srcdir)/config/aarch64/aarch64-builtins.c
+ 
+ aarch64-sve-builtins.o: $(srcdir)/config/aarch64/aarch64-sve-builtins.cc \

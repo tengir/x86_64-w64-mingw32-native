@@ -1,0 +1,12 @@
+--- a/gcc/config/host-darwin.c  2020-11-21 14:12:58.180909052 -0400
++++ b/gcc/config/host-darwin.c  2020-11-21 14:13:51.456526106 -0400
+@@ -22,6 +22,9 @@
+ #include "coretypes.h"
+ #include "diagnostic-core.h"
+ #include "config/host-darwin.h"
++#include "hosthooks.h"
++#include "hosthooks-def.h"
++const struct host_hooks host_hooks = HOST_HOOKS_INITIALIZER;
+ 
+ /* Yes, this is really supposed to work.  */
+ static char pch_address_space[1024*1024*1024] __attribute__((aligned (4096)));
