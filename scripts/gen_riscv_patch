@@ -1,0 +1,47 @@
+#!/bin/sh
+
+# Generates a patch to incorporate RISC-V support into upstream
+# musl. Note: the steps below should be used:
+#
+#   $ git clone git://git.musl-libc.org/musl musl
+#   $ cd musl
+#   $ git remote add riscv https://github.com/riscv/riscv-musl.git
+#   $ git fetch riscv
+#   $ git merge --squash riscv/develop riscv/staging
+#   $ git commit --no-edit
+#   $ git format-patch -1
+#
+# However, the approach below is used for other reasons.
+
+r_clean ()
+{
+    rm -fr a b c;
+}
+
+r_clone ()
+{
+    git clone git://git.musl-libc.org/musl            -b  master a;
+    git clone https://github.com/riscv/riscv-musl.git -b develop b;
+    git clone https://github.com/riscv/riscv-musl.git -b staging c;
+}
+
+r_merge ()
+{
+    (
+        cd c;
+        git pull --no-edit ../b;
+        git pull --no-edit ../a;
+    )
+    rm -fr $(find . -type d -name ".git");
+}
+
+r_patch ()
+{
+    diff -urN a c > 0001-$(date +%Y%m%d)-merge-riscv.patch;
+}
+
+r_clean;
+r_clone;
+r_merge;
+r_patch;
+r_clean;

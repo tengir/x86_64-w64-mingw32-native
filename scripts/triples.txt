@@ -1,0 +1,5 @@
+# Comment any out that you do not wish to build.
+# Do not leave any empty lines in this file.
+#
+i686-w64-mingw32
+x86_64-w64-mingw32

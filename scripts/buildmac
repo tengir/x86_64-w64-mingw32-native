@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# https://stackoverflow.com/a/1116890
+s=$(pwd)
+_=$0
+cd `dirname $0`
+_=`basename $_`
+#while [ -L "$_" ]; do
+#    _=`readlink $_`;
+#    cd `dirname $_`;
+#    _=`basename $_`;
+#done
+HERE=`pwd -P`/$_
+cd $s
+
+LIST=${HERE}/triples.txt
+LOGS=${HERE}/../logs
+BINS=${HERE}/../output
+
+CSUF=cross
+
+KALE="${PATH}"
+
+mkdir -p ${LOGS} ${BINS}
+for t in $(cat ${LIST} | grep -v "#"); do
+    [ -d ${BINS}/${t}-${CSUF} ] || make install \
+        TARGET=${t} OUTPUT=${BINS}/${t}-${CSUF} \
+        -j$(sysctl hw.logicalcpu | awk '{print $2}') 2>&1 \
+            | tee ${LOGS}/${t}-${CSUF}.log
+done;
+
+cd ${BINS}
+for t in $(find . -mindepth 1 -maxdepth 1 -type d); do
+    [ -h ${t}/usr ] || (cd ${t} && ln -s . usr)
+    [ -e ${t}.tgz ] || tar pczf ${t}.tgz ${t};
+done

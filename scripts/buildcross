@@ -1,0 +1,24 @@
+#!/bin/sh
+
+HERE=$(dirname $(readlink -f ${0}))
+
+LIST=${HERE}/triples.txt
+LOGS=${HERE}/../logs
+BINS=${HERE}/../output
+
+CSUF=cross
+
+KALE="${PATH}"
+
+mkdir -p ${LOGS} ${BINS}
+for t in $(cat ${LIST} | grep -v "#"); do
+    [ -d ${BINS}/${t}-${CSUF} ] || make -O install \
+        TARGET=${t} OUTPUT=${BINS}/${t}-${CSUF} \
+        -j$(nproc) 2>&1 | tee ${LOGS}/${t}-${CSUF}.log
+done;
+
+cd ${BINS}
+for t in $(find . -mindepth 1 -maxdepth 1 -type d); do
+    [ -h ${t}/usr ] || cd ${t} && ln -s . usr && cd ${BINS}
+    [ -e ${t}.tgz ] || tar pczf ${t}.tgz ${t};
+done

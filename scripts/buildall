@@ -1,0 +1,38 @@
+#!/bin/sh
+
+HERE=$(dirname $(readlink -f ${0}))
+
+LIST=${HERE}/triples.txt
+LOGS=${HERE}/../logs
+BINS=${HERE}/../output
+
+CSUF=cross
+NSUF=native
+
+KALE="${PATH}"
+
+mkdir -p ${LOGS} ${BINS}
+for t in $(cat ${LIST} | grep -v "#"); do
+    [ -d ${BINS}/${t}-${CSUF} ] || make install \
+        TARGET=${t} OUTPUT=${BINS}/${t}-${CSUF} \
+        -j$(nproc) 2>&1 | tee ${LOGS}/${t}-${CSUF}.log
+    if [ -d ${BINS}/${t}-${CSUF} ]; then
+        export PATH="${KALE}:${BINS}/${t}-${CSUF}/bin"
+        [ -d ${BINS}/${t}-${NSUF} ] || make install NATIVE=1 -ik -O \
+            TARGET=${t} CROSS_COMPILE=${t}- OUTPUT=${BINS}/${t}-${NSUF} \
+            -j$(nproc) 2>&1 | tee ${LOGS}/${t}-${NSUF}.log
+        export PATH="${KALE}"
+    fi;
+done;
+
+cd ${BINS}
+for t in $(find . -mindepth 1 -maxdepth 1 -type d); do
+    [ -h ${t}/usr ] || (cd ${t} && ln -s . usr)
+    if [ "x${t##*-}" = "xnative" ]; then
+        find ${t} -type l -delete
+        (cd ${t} && [ -d ${t%-*}/include ] || cp -R include ${t%-*})
+        [ -e ${t}.zip ] || zip -rq  ${t}.zip ${t};
+    else
+        [ -e ${t}.tgz ] || tar pczf ${t}.tgz ${t};
+    fi
+done
