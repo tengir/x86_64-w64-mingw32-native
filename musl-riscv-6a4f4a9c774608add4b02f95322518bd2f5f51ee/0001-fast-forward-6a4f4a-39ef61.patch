@@ -1,0 +1,3418 @@
+From 0beb9dfbecad38af9759b1e83eeb007e28b70abb Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 1 Oct 2018 18:37:02 -0400
+Subject: [PATCH 01/46] add TLSDESC support for 32-bit arm
+
+unlike other asm where the baseline ISA is used, these functions are
+hot paths and use ISA-level specializations.
+
+call-clobbered vfp registers are saved before calling __tls_get_new,
+since there is no guarantee it won't use them. while setjmp/longjmp
+have to use hwcap to decide whether to the fpu is in use, since
+application code could be using vfp registers even if libc was
+compiled as pure softfloat, __tls_get_new is part of libc and can be
+assumed not to have access to vfp registers if tlsdesc.S does not.
+thus it suffices just to check the predefined preprocessor macros. the
+check for __ARM_PCS_VFP is redundant; !__SOFTFP__ must always be true
+if the target ISA level includes fpu instructions/registers.
+---
+ arch/arm/reloc.h       |  4 ++-
+ ldso/dynlink.c         |  7 +++++
+ src/ldso/arm/tlsdesc.S | 62 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+), 1 deletion(-)
+ create mode 100644 src/ldso/arm/tlsdesc.S
+
+diff --git a/arch/arm/reloc.h b/arch/arm/reloc.h
+index 4b00bf64..2c2e7f58 100644
+--- a/arch/arm/reloc.h
++++ b/arch/arm/reloc.h
+@@ -26,7 +26,9 @@
+ #define REL_DTPMOD      R_ARM_TLS_DTPMOD32
+ #define REL_DTPOFF      R_ARM_TLS_DTPOFF32
+ #define REL_TPOFF       R_ARM_TLS_TPOFF32
+-//#define REL_TLSDESC     R_ARM_TLS_DESC
++#define REL_TLSDESC     R_ARM_TLS_DESC
++
++#define TLSDESC_BACKWARDS
+ 
+ #define CRTJMP(pc,sp) __asm__ __volatile__( \
+ 	"mov sp,%1 ; bx %0" : : "r"(pc), "r"(sp) : "memory" )
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+index 3ecbddfa..c2892b90 100644
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -458,6 +458,13 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
+ 					+ addend;
+ #endif
+ 			}
++#ifdef TLSDESC_BACKWARDS
++			/* Some archs (32-bit ARM at least) invert the order of
++			 * the descriptor members. Fix them up here. */
++			size_t tmp = reloc_addr[0];
++			reloc_addr[0] = reloc_addr[1];
++			reloc_addr[1] = tmp;
++#endif
+ 			break;
+ 		default:
+ 			error("Error relocating %s: unsupported relocation type %d",
+diff --git a/src/ldso/arm/tlsdesc.S b/src/ldso/arm/tlsdesc.S
+new file mode 100644
+index 00000000..f3d67fce
+--- /dev/null
++++ b/src/ldso/arm/tlsdesc.S
+@@ -0,0 +1,62 @@
++.syntax unified
++
++.text
++.global __tlsdesc_static
++.hidden __tlsdesc_static
++.type __tlsdesc_static,%function
++__tlsdesc_static:
++	ldr r0,[r0]
++	bx lr
++
++.hidden __tls_get_new
++
++.global __tlsdesc_dynamic
++.hidden __tlsdesc_dynamic
++.type __tlsdesc_dynamic,%function
++__tlsdesc_dynamic:
++	push {r2,r3,ip,lr}
++	ldr r1,[r0]
++	ldr r2,[r1,#4]  // r2 = offset
++	ldr r1,[r1]     // r1 = modid
++
++	ldr r0,1f
++	add r0,r0,pc
++	ldr r0,[r0]
++2:
++#if __ARM_ARCH >= 5
++	blx r0          // r0 = tp
++#else
++	mov lr,pc
++	bx r0
++#endif
++	ldr r3,[r0,#-4] // r3 = dtv
++	ldr ip,[r3]     // ip = dtv slot count
++	cmp r1,ip
++	bhi 3f
++	ldr ip,[r3,r1,LSL #2]
++	sub r0,ip,r0
++	add r0,r0,r2    // r0 = r3[r1]-r0+r2
++4:
++#if __ARM_ARCH >= 5
++	pop {r2,r3,ip,pc}
++#else
++	pop {r2,r3,ip,lr}
++	bx lr
++#endif
++
++3:
++#if __ARM_PCS_VFP || !__SOFTFP__
++	vpush {d0-d7}
++#endif
++	push {r0-r3}
++	add r0,sp,#4
++	bl __tls_get_new
++	pop {r1-r3,ip}
++#if __ARM_PCS_VFP || !__SOFTFP__
++	vpop {d0-d7}
++#endif
++	sub r0,r0,r1    // r0 = retval-tp
++	b 4b
++
++	.align 2
++1:	.word __a_gettp_ptr - 2b
+-- 
+2.18.1
+
+
+From 7bf773a8f9b97875ba67b646c1681ac5ca22016f Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 1 Oct 2018 19:36:14 -0400
+Subject: [PATCH 02/46] inline cp15 thread pointer load in arm dynamic TLSDESC
+ asm when possible
+
+the indirect function call is a significant portion of the code path
+for the dynamic case, and most users are probably building for ISA
+levels where it can be omitted.
+
+we could drop at least one register save/restore (lr) with this
+change, and possibly another (ip) with some clever shuffling, but it's
+not clear whether there's a way to do it that's not more expensive, or
+whether avoiding the save/restore would have any practical effect, so
+in the interest of avoiding complexity it's omitted for now.
+---
+ src/ldso/arm/tlsdesc.S | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/ldso/arm/tlsdesc.S b/src/ldso/arm/tlsdesc.S
+index f3d67fce..b81f3111 100644
+--- a/src/ldso/arm/tlsdesc.S
++++ b/src/ldso/arm/tlsdesc.S
+@@ -19,6 +19,10 @@ __tlsdesc_dynamic:
+ 	ldr r2,[r1,#4]  // r2 = offset
+ 	ldr r1,[r1]     // r1 = modid
+ 
++#if ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
++ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
++	mrc p15,0,r0,c13,c0,3
++#else
+ 	ldr r0,1f
+ 	add r0,r0,pc
+ 	ldr r0,[r0]
+@@ -28,6 +32,7 @@ __tlsdesc_dynamic:
+ #else
+ 	mov lr,pc
+ 	bx r0
++#endif
+ #endif
+ 	ldr r3,[r0,#-4] // r3 = dtv
+ 	ldr ip,[r3]     // ip = dtv slot count
+@@ -58,5 +63,9 @@ __tlsdesc_dynamic:
+ 	sub r0,r0,r1    // r0 = retval-tp
+ 	b 4b
+ 
++#if ((__ARM_ARCH_6K__ || __ARM_ARCH_6KZ__ || __ARM_ARCH_6ZK__) && !__thumb__) \
++ || __ARM_ARCH_7A__ || __ARM_ARCH_7R__ || __ARM_ARCH >= 7
++#else
+ 	.align 2
+ 1:	.word __a_gettp_ptr - 2b
++#endif
+-- 
+2.18.1
+
+
+From d1395c43c019aec6b855cf3c656bf47c8a719e7f Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 4 Oct 2018 20:27:17 -0400
+Subject: [PATCH 03/46] allow freeaddrinfo of arbitrary sublists of addrinfo
+ list
+
+the specification for freeaddrinfo allows it to be used to free
+"arbitrary sublists" of the list returned by getaddrinfo. it's not
+clearly stated how such sublists come into existence, but the
+interpretation seems to be that the application can edit the ai_next
+pointers to cut off a portion of the list and then free it.
+
+actual freeing of individual list slots is contrary to the design of
+our getaddrinfo implementation, which has no failure paths after
+making a single allocation, so that light callers can avoid linking
+realloc/free. freeing individual slots is also incompatible with
+sharing the string for ai_canonname, which the current implementation
+does despite no requirement that it be present except on the first
+result. so, rather than actually freeing individual slots, provide a
+way to find the start of the allocated array, and reference-count it,
+freeing the memory all at once after the last slot has been freed.
+
+since the language in the spec is "arbitrary sublists", no provision
+for handling other constructs like multiple lists glued together,
+circular links, etc. is made. presumably passing such a construct to
+freeaddrinfo produces undefined behavior.
+---
+ src/network/freeaddrinfo.c | 11 ++++++++++-
+ src/network/getaddrinfo.c  | 10 +++-------
+ src/network/lookup.h       | 12 ++++++++++++
+ 3 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/src/network/freeaddrinfo.c b/src/network/freeaddrinfo.c
+index df3798ae..62241c23 100644
+--- a/src/network/freeaddrinfo.c
++++ b/src/network/freeaddrinfo.c
+@@ -1,7 +1,16 @@
+ #include <stdlib.h>
++#include <stddef.h>
+ #include <netdb.h>
++#include "lookup.h"
++#include "lock.h"
+ 
+ void freeaddrinfo(struct addrinfo *p)
+ {
+-	free(p);
++	size_t cnt;
++	for (cnt=1; p->ai_next; cnt++, p=p->ai_next);
++	struct aibuf *b = (void *)((char *)p - offsetof(struct aibuf, ai));
++	b -= b->slot;
++	LOCK(b->lock);
++	if (!(b->ref -= cnt)) free(b);
++	else UNLOCK(b->lock);
+ }
+diff --git a/src/network/getaddrinfo.c b/src/network/getaddrinfo.c
+index e33bfa28..5ae8cbfb 100644
+--- a/src/network/getaddrinfo.c
++++ b/src/network/getaddrinfo.c
+@@ -16,13 +16,7 @@ int getaddrinfo(const char *restrict host, const char *restrict serv, const stru
+ 	char canon[256], *outcanon;
+ 	int nservs, naddrs, nais, canon_len, i, j, k;
+ 	int family = AF_UNSPEC, flags = 0, proto = 0, socktype = 0;
+-	struct aibuf {
+-		struct addrinfo ai;
+-		union sa {
+-			struct sockaddr_in sin;
+-			struct sockaddr_in6 sin6;
+-		} sa;
+-	} *out;
++	struct aibuf *out;
+ 
+ 	if (!host && !serv) return EAI_NONAME;
+ 
+@@ -110,6 +104,7 @@ int getaddrinfo(const char *restrict host, const char *restrict serv, const stru
+ 	}
+ 
+ 	for (k=i=0; i<naddrs; i++) for (j=0; j<nservs; j++, k++) {
++		out[k].slot = i;
+ 		out[k].ai = (struct addrinfo){
+ 			.ai_family = addrs[i].family,
+ 			.ai_socktype = ports[j].socktype,
+@@ -134,6 +129,7 @@ int getaddrinfo(const char *restrict host, const char *restrict serv, const stru
+ 			break;			
+ 		}
+ 	}
++	out[0].ref = nais;
+ 	out[nais-1].ai.ai_next = 0;
+ 	*res = &out->ai;
+ 	return 0;
+diff --git a/src/network/lookup.h b/src/network/lookup.h
+index f1952af5..ef662725 100644
+--- a/src/network/lookup.h
++++ b/src/network/lookup.h
+@@ -4,6 +4,18 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ #include <features.h>
++#include <netinet/in.h>
++#include <netdb.h>
++
++struct aibuf {
++	struct addrinfo ai;
++	union sa {
++		struct sockaddr_in sin;
++		struct sockaddr_in6 sin6;
++	} sa;
++	volatile int lock[1];
++	short slot, ref;
++};
+ 
+ struct address {
+ 	int family;
+-- 
+2.18.1
+
+
+From b3389bbfb58697623621c70fade6e239952d0813 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 9 Oct 2018 10:59:39 -0400
+Subject: [PATCH 04/46] fix build regression on armhf in tlsdesc asm
+
+when invoking the assembler, arm gcc does not always pass the right
+flags to enable use of vfp instruction mnemonics. for C code it
+produces, it emits the .fpu directive, but this does not help when
+building asm source files, which tlsdesc needs to be. to fix, use an
+explicit directive here.
+
+commit 0beb9dfbecad38af9759b1e83eeb007e28b70abb introduced this
+regression. it has not appeared in any release.
+---
+ src/ldso/arm/tlsdesc.S | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/ldso/arm/tlsdesc.S b/src/ldso/arm/tlsdesc.S
+index b81f3111..4e67c3e2 100644
+--- a/src/ldso/arm/tlsdesc.S
++++ b/src/ldso/arm/tlsdesc.S
+@@ -51,6 +51,7 @@ __tlsdesc_dynamic:
+ 
+ 3:
+ #if __ARM_PCS_VFP || !__SOFTFP__
++	.fpu vfp
+ 	vpush {d0-d7}
+ #endif
+ 	push {r0-r3}
+-- 
+2.18.1
+
+
+From 7b384c42b73ca1a1e150b3f255990ec53cedec60 Mon Sep 17 00:00:00 2001
+From: Szabolcs Nagy <nsz@port70.net>
+Date: Mon, 10 Sep 2018 19:06:21 +0000
+Subject: [PATCH 05/46] fix fesetround error checking
+
+Rounding modes are not bit flags, but arbitrary non-negative integers.
+---
+ src/fenv/fesetround.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/src/fenv/fesetround.c b/src/fenv/fesetround.c
+index 50e58f11..4e2f164d 100644
+--- a/src/fenv/fesetround.c
++++ b/src/fenv/fesetround.c
+@@ -7,18 +7,17 @@ hidden int __fesetround(int);
+ 
+ int fesetround(int r)
+ {
+-	if (r & ~(
+-		FE_TONEAREST
++	if (r != FE_TONEAREST
+ #ifdef FE_DOWNWARD
+-		|FE_DOWNWARD
++		&& r != FE_DOWNWARD
+ #endif
+ #ifdef FE_UPWARD
+-		|FE_UPWARD
++		&& r != FE_UPWARD
+ #endif
+ #ifdef FE_TOWARDZERO
+-		|FE_TOWARDZERO
++		&& r != FE_TOWARDZERO
+ #endif
+-		))
++	)
+ 		return -1;
+ 	return __fesetround(r);
+ }
+-- 
+2.18.1
+
+
+From e2552581bc004f7dc5ee9ac220cad8abeae19bba Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 11 Oct 2018 14:23:14 -0400
+Subject: [PATCH 06/46] fix invalid substitute of [1] for flexible array member
+ in glob
+
+---
+ src/regex/glob.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/regex/glob.c b/src/regex/glob.c
+index 746da77d..98636295 100644
+--- a/src/regex/glob.c
++++ b/src/regex/glob.c
+@@ -11,7 +11,7 @@
+ struct match
+ {
+ 	struct match *next;
+-	char name[1];
++	char name[];
+ };
+ 
+ static int is_literal(const char *p, int useesc)
+@@ -37,7 +37,7 @@ static int is_literal(const char *p, int useesc)
+ 
+ static int append(struct match **tail, const char *name, size_t len, int mark)
+ {
+-	struct match *new = malloc(sizeof(struct match) + len + 1);
++	struct match *new = malloc(sizeof(struct match) + len + 2);
+ 	if (!new) return -1;
+ 	(*tail)->next = new;
+ 	new->next = NULL;
+-- 
+2.18.1
+
+
+From 09a805a62307307230a31125425d0c2b0b6f332e Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 11 Oct 2018 14:27:15 -0400
+Subject: [PATCH 07/46] fix redundant computations of strlen in glob append
+ function
+
+len was already passed as an argument, so don't use strcat, and use
+memcpy instead of strcpy.
+---
+ src/regex/glob.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/regex/glob.c b/src/regex/glob.c
+index 98636295..3e1b034e 100644
+--- a/src/regex/glob.c
++++ b/src/regex/glob.c
+@@ -41,8 +41,11 @@ static int append(struct match **tail, const char *name, size_t len, int mark)
+ 	if (!new) return -1;
+ 	(*tail)->next = new;
+ 	new->next = NULL;
+-	strcpy(new->name, name);
+-	if (mark) strcat(new->name, "/");
++	memcpy(new->name, name, len+1);
++	if (mark) {
++		new->name[len] = '/';
++		new->name[len+1] = 0;
++	}
+ 	*tail = new;
+ 	return 0;
+ }
+-- 
+2.18.1
+
+
+From b6d701a47504e5ef9c6a19b2f6a703c72cb9e8ac Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 12 Oct 2018 00:30:34 -0400
+Subject: [PATCH 08/46] combine arch ABI's DTP_OFFSET into DTV pointers
+
+as explained in commit 6ba5517a460c6c438f64d69464fdfc3269a4c91a, some
+archs use an offset (typicaly -0x8000) with their DTPOFF relocations,
+which __tls_get_addr needs to invert. on affected archs, which lack
+direct support for large immediates, this can cost multiple extra
+instructions in the hot path. instead, incorporate the DTP_OFFSET into
+the DTV entries. this means they are no longer valid pointers, so
+store them as an array of uintptr_t rather than void *; this also
+makes it easier to access slot 0 as a valid slot count.
+
+commit e75b16cf93ebbc1ce758d3ea6b2923e8b2457c68 left behind cruft in
+two places, __reset_tls and __tls_get_new, from back when it was
+possible to have uninitialized gap slots indicated by a null pointer
+in the DTV. since the concept of null pointer is no longer meaningful
+with an offset applied, remove this cruft.
+
+presently there are no archs with both TLSDESC and nonzero DTP_OFFSET,
+but the dynamic TLSDESC relocation code is also updated to apply an
+inverted offset to its offset field, so that the offset DTV would not
+impose a runtime cost in TLSDESC resolver functions.
+---
+ ldso/dynlink.c              | 25 +++++++++++--------------
+ src/env/__init_tls.c        | 16 ++++++++--------
+ src/env/__reset_tls.c       |  9 ++++-----
+ src/internal/pthread_impl.h |  5 +++--
+ src/thread/__tls_get_addr.c |  4 ++--
+ 5 files changed, 28 insertions(+), 31 deletions(-)
+
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+index c2892b90..a3ca3cdf 100644
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -72,7 +72,7 @@ struct dso {
+ 	struct tls_module tls;
+ 	size_t tls_id;
+ 	size_t relro_start, relro_end;
+-	void **new_dtv;
++	uintptr_t *new_dtv;
+ 	unsigned char *new_tls;
+ 	volatile int new_dtv_idx, new_tls_idx;
+ 	struct td_index *td_index;
+@@ -445,7 +445,7 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
+ 				new->next = dso->td_index;
+ 				dso->td_index = new;
+ 				new->args[0] = def.dso->tls_id;
+-				new->args[1] = tls_val + addend;
++				new->args[1] = tls_val + addend - DTP_OFFSET;
+ 				reloc_addr[0] = (size_t)__tlsdesc_dynamic;
+ 				reloc_addr[1] = (size_t)new;
+ 			} else {
+@@ -1345,9 +1345,9 @@ hidden void *__tls_get_new(tls_mod_off_t *v)
+ 	/* Block signals to make accessing new TLS async-signal-safe */
+ 	sigset_t set;
+ 	__block_all_sigs(&set);
+-	if (v[0]<=(size_t)self->dtv[0]) {
++	if (v[0] <= self->dtv[0]) {
+ 		__restore_sigs(&set);
+-		return (char *)self->dtv[v[0]]+v[1]+DTP_OFFSET;
++		return (void *)(self->dtv[v[0]] + v[1]);
+ 	}
+ 
+ 	/* This is safe without any locks held because, if the caller
+@@ -1357,15 +1357,12 @@ hidden void *__tls_get_new(tls_mod_off_t *v)
+ 	struct dso *p;
+ 	for (p=head; p->tls_id != v[0]; p=p->next);
+ 
+-	/* Get new DTV space from new DSO if needed */
+-	if (v[0] > (size_t)self->dtv[0]) {
+-		void **newdtv = p->new_dtv +
+-			(v[0]+1)*a_fetch_add(&p->new_dtv_idx,1);
+-		memcpy(newdtv, self->dtv,
+-			((size_t)self->dtv[0]+1) * sizeof(void *));
+-		newdtv[0] = (void *)v[0];
+-		self->dtv = self->dtv_copy = newdtv;
+-	}
++	/* Get new DTV space from new DSO */
++	uintptr_t *newdtv = p->new_dtv +
++		(v[0]+1)*a_fetch_add(&p->new_dtv_idx,1);
++	memcpy(newdtv, self->dtv, (self->dtv[0]+1) * sizeof(uintptr_t));
++	newdtv[0] = v[0];
++	self->dtv = self->dtv_copy = newdtv;
+ 
+ 	/* Get new TLS memory from all new DSOs up to the requested one */
+ 	unsigned char *mem;
+@@ -1375,7 +1372,7 @@ hidden void *__tls_get_new(tls_mod_off_t *v)
+ 			* a_fetch_add(&p->new_tls_idx,1);
+ 		mem += ((uintptr_t)p->tls.image - (uintptr_t)mem)
+ 			& (p->tls.align-1);
+-		self->dtv[p->tls_id] = mem;
++		self->dtv[p->tls_id] = (uintptr_t)mem + DTP_OFFSET;
+ 		memcpy(mem, p->tls.image, p->tls.len);
+ 		if (p->tls_id == v[0]) break;
+ 	}
+diff --git a/src/env/__init_tls.c b/src/env/__init_tls.c
+index 96d0e284..842886f6 100644
+--- a/src/env/__init_tls.c
++++ b/src/env/__init_tls.c
+@@ -36,32 +36,32 @@ void *__copy_tls(unsigned char *mem)
+ 	pthread_t td;
+ 	struct tls_module *p;
+ 	size_t i;
+-	void **dtv;
++	uintptr_t *dtv;
+ 
+ #ifdef TLS_ABOVE_TP
+-	dtv = (void **)(mem + libc.tls_size) - (libc.tls_cnt + 1);
++	dtv = (uintptr_t*)(mem + libc.tls_size) - (libc.tls_cnt + 1);
+ 
+ 	mem += -((uintptr_t)mem + sizeof(struct pthread)) & (libc.tls_align-1);
+ 	td = (pthread_t)mem;
+ 	mem += sizeof(struct pthread);
+ 
+ 	for (i=1, p=libc.tls_head; p; i++, p=p->next) {
+-		dtv[i] = mem + p->offset;
+-		memcpy(dtv[i], p->image, p->len);
++		dtv[i] = (uintptr_t)(mem + p->offset) + DTP_OFFSET;
++		memcpy(mem + p->offset, p->image, p->len);
+ 	}
+ #else
+-	dtv = (void **)mem;
++	dtv = (uintptr_t *)mem;
+ 
+ 	mem += libc.tls_size - sizeof(struct pthread);
+ 	mem -= (uintptr_t)mem & (libc.tls_align-1);
+ 	td = (pthread_t)mem;
+ 
+ 	for (i=1, p=libc.tls_head; p; i++, p=p->next) {
+-		dtv[i] = mem - p->offset;
+-		memcpy(dtv[i], p->image, p->len);
++		dtv[i] = (uintptr_t)(mem - p->offset) + DTP_OFFSET;
++		memcpy(mem - p->offset, p->image, p->len);
+ 	}
+ #endif
+-	dtv[0] = (void *)libc.tls_cnt;
++	dtv[0] = libc.tls_cnt;
+ 	td->dtv = td->dtv_copy = dtv;
+ 	return td;
+ }
+diff --git a/src/env/__reset_tls.c b/src/env/__reset_tls.c
+index 677e57f5..15685bc6 100644
+--- a/src/env/__reset_tls.c
++++ b/src/env/__reset_tls.c
+@@ -6,11 +6,10 @@ void __reset_tls()
+ {
+ 	pthread_t self = __pthread_self();
+ 	struct tls_module *p;
+-	size_t i, n = (size_t)self->dtv[0];
++	size_t i, n = self->dtv[0];
+ 	if (n) for (p=libc.tls_head, i=1; i<=n; i++, p=p->next) {
+-		if (!self->dtv[i]) continue;
+-		memcpy(self->dtv[i], p->image, p->len);
+-		memset((char *)self->dtv[i]+p->len, 0,
+-			p->size - p->len);
++		char *mem = (char *)(self->dtv[i] - DTP_OFFSET);
++		memcpy(mem, p->image, p->len);
++		memset(mem+p->len, 0, p->size - p->len);
+ 	}
+ }
+diff --git a/src/internal/pthread_impl.h b/src/internal/pthread_impl.h
+index d491f975..7a25b88e 100644
+--- a/src/internal/pthread_impl.h
++++ b/src/internal/pthread_impl.h
+@@ -17,7 +17,8 @@ struct pthread {
+ 	/* Part 1 -- these fields may be external or
+ 	 * internal (accessed via asm) ABI. Do not change. */
+ 	struct pthread *self;
+-	void **dtv, *unused1, *unused2;
++	uintptr_t *dtv;
++	void *unused1, *unused2;
+ 	uintptr_t sysinfo;
+ 	uintptr_t canary, canary2;
+ 
+@@ -54,7 +55,7 @@ struct pthread {
+ 	/* Part 3 -- the positions of these fields relative to
+ 	 * the end of the structure is external and internal ABI. */
+ 	uintptr_t canary_at_end;
+-	void **dtv_copy;
++	uintptr_t *dtv_copy;
+ };
+ 
+ struct start_sched_args {
+diff --git a/src/thread/__tls_get_addr.c b/src/thread/__tls_get_addr.c
+index 34fbc46c..d7afdabd 100644
+--- a/src/thread/__tls_get_addr.c
++++ b/src/thread/__tls_get_addr.c
+@@ -4,8 +4,8 @@
+ void *__tls_get_addr(tls_mod_off_t *v)
+ {
+ 	pthread_t self = __pthread_self();
+-	if (v[0]<=(size_t)self->dtv[0])
+-		return (char *)self->dtv[v[0]]+v[1]+DTP_OFFSET;
++	if (v[0] <= self->dtv[0])
++		return (void *)(self->dtv[v[0]] + v[1]);
+ 	return __tls_get_new(v);
+ }
+ 
+-- 
+2.18.1
+
+
+From 37cd1676395e5ebdae3f372bf59d4fef54be9818 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 12 Oct 2018 12:26:44 -0400
+Subject: [PATCH 09/46] fix dlsym of thread-local symbols on archs with
+ DTP_OFFSET!=0
+
+commit 6ba5517a460c6c438f64d69464fdfc3269a4c91a modified
+__tls_get_addr to offset the address by +DTP_OFFSET (0x8000 on
+powerpc, mips, etc.) and adjusted the result of DTPREL relocations by
+-DTP_OFFSET to compensate, but missed changing the argument setup for
+calls to __tls_get_addr from dlsym.
+---
+ ldso/dynlink.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+index a3ca3cdf..42b078cf 100644
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -1918,7 +1918,7 @@ static void *do_dlsym(struct dso *p, const char *s, void *ra)
+ 		struct symdef def = find_sym(p, s, 0);
+ 		if (!def.sym) goto failed;
+ 		if ((def.sym->st_info&0xf) == STT_TLS)
+-			return __tls_get_addr((tls_mod_off_t []){def.dso->tls_id, def.sym->st_value});
++			return __tls_get_addr((tls_mod_off_t []){def.dso->tls_id, def.sym->st_value-DTP_OFFSET});
+ 		if (DL_FDPIC && (def.sym->st_info&0xf) == STT_FUNC)
+ 			return def.dso->funcdescs + (def.sym - def.dso->syms);
+ 		return laddr(def.dso, def.sym->st_value);
+@@ -1933,7 +1933,7 @@ static void *do_dlsym(struct dso *p, const char *s, void *ra)
+ 		sym = sysv_lookup(s, h, p);
+ 	}
+ 	if (sym && (sym->st_info&0xf) == STT_TLS)
+-		return __tls_get_addr((tls_mod_off_t []){p->tls_id, sym->st_value});
++		return __tls_get_addr((tls_mod_off_t []){p->tls_id, sym->st_value-DTP_OFFSET});
+ 	if (DL_FDPIC && sym && sym->st_shndx && (sym->st_info&0xf) == STT_FUNC)
+ 		return p->funcdescs + (sym - p->syms);
+ 	if (sym && sym->st_value && (1<<(sym->st_info&0xf) & OK_TYPES))
+@@ -1947,7 +1947,7 @@ static void *do_dlsym(struct dso *p, const char *s, void *ra)
+ 			sym = sysv_lookup(s, h, p->deps[i]);
+ 		}
+ 		if (sym && (sym->st_info&0xf) == STT_TLS)
+-			return __tls_get_addr((tls_mod_off_t []){p->deps[i]->tls_id, sym->st_value});
++			return __tls_get_addr((tls_mod_off_t []){p->deps[i]->tls_id, sym->st_value-DTP_OFFSET});
+ 		if (DL_FDPIC && sym && sym->st_shndx && (sym->st_info&0xf) == STT_FUNC)
+ 			return p->deps[i]->funcdescs + (sym - p->deps[i]->syms);
+ 		if (sym && sym->st_value && (1<<(sym->st_info&0xf) & OK_TYPES))
+-- 
+2.18.1
+
+
+From d44b07fc904f6a0d31ba025f3e9f423c1e47547e Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 12 Oct 2018 22:32:41 -0400
+Subject: [PATCH 10/46] rewrite core of the glob implementation for correctness
+ & optimization
+
+this code has been long overdue for a rewrite, but the immediate cause
+that necessitated it was total failure to see past unreadable path
+components. for example, A/B/* would fail to match anything, even
+though it should succeed, when both A and A/B are searchable but only
+A/B is readable. this problem both was caught in conformance testing,
+and impacted users.
+
+the old glob implementation insisted on searching the listing of each
+path component for a match, even if the next component was a literal.
+it also used considerable stack space, up to length of the pattern,
+per recursion level, and relied on an artificial bound of the pattern
+length by PATH_MAX, which was incorrect because a pattern can be much
+longer than PATH_MAX while having matches shorter (for example, with
+necessarily long bracket expressions, or with redundancy).
+
+in the new implementation, each level of recursion starts by consuming
+the maximal literal (possibly escaped-literal) path prefix remaining
+in the pattern, and only opening a directory to read when there is a
+proper glob pattern in the next path component. it then recurses into
+each matching entry. the top-level glob function provided automatic
+storage (up to PATH_MAX) for construction of candidate/result strings,
+and allocates a duplicate of the pattern that can be modified in-place
+with temporary null-termination to pass to fnmatch. this allocation is
+not a big deal since glob already has to perform allocation, and has
+to link free to clean up if it experiences an allocation failure or
+other error after some results have already been allocated.
+
+care is taken to use the d_type field from iterated dirents when
+possible; stat is called only when there are literal path components
+past the last proper-glob component, or when needed to disambiguate
+symlinks for the purpose of GLOB_MARK.
+
+one peculiarity with the new implementation is the manner in which the
+error handling callback will be called. if attempting to match */B/C/D
+where a directory A exists that is inaccessible, the error reported
+will be a stat error for A/B/C/D rather than (previous and wrong
+implementation) an opendir error for A, or (likely on other
+implementations) a stat error for A/B. such behavior does not seem to
+be non-conforming, but if it turns out to be undesirable for any
+reason, backtracking could be done on error to report the first
+component producing it.
+
+also, redundant slashes are no longer normalized, but preserved as
+they appear in the pattern; this is probably more correct, and falls
+out naturally from the algorithm used. since trailing slashes (which
+force all matches to be directories) are preserved as well, the
+behavior of GLOB_MARK has been adjusted not to append an additional
+slash to results that already end in slash.
+---
+ src/regex/glob.c | 217 ++++++++++++++++++++++++-----------------------
+ 1 file changed, 112 insertions(+), 105 deletions(-)
+
+diff --git a/src/regex/glob.c b/src/regex/glob.c
+index 3e1b034e..751b6966 100644
+--- a/src/regex/glob.c
++++ b/src/regex/glob.c
+@@ -1,3 +1,4 @@
++#define _BSD_SOURCE
+ #include <glob.h>
+ #include <fnmatch.h>
+ #include <sys/stat.h>
+@@ -14,27 +15,6 @@ struct match
+ 	char name[];
+ };
+ 
+-static int is_literal(const char *p, int useesc)
+-{
+-	int bracket = 0;
+-	for (; *p; p++) {
+-		switch (*p) {
+-		case '\\':
+-			if (!useesc) break;
+-		case '?':
+-		case '*':
+-			return 0;
+-		case '[':
+-			bracket = 1;
+-			break;
+-		case ']':
+-			if (bracket) return 0;
+-			break;
+-		}
+-	}
+-	return 1;
+-}
+-
+ static int append(struct match **tail, const char *name, size_t len, int mark)
+ {
+ 	struct match *new = malloc(sizeof(struct match) + len + 2);
+@@ -42,7 +22,7 @@ static int append(struct match **tail, const char *name, size_t len, int mark)
+ 	(*tail)->next = new;
+ 	new->next = NULL;
+ 	memcpy(new->name, name, len+1);
+-	if (mark) {
++	if (mark && len && name[len-1]!='/') {
+ 		new->name[len] = '/';
+ 		new->name[len+1] = 0;
+ 	}
+@@ -50,96 +30,125 @@ static int append(struct match **tail, const char *name, size_t len, int mark)
+ 	return 0;
+ }
+ 
+-static int match_in_dir(const char *d, const char *p, int flags, int (*errfunc)(const char *path, int err), struct match **tail)
++static int do_glob(char *buf, size_t pos, int type, char *pat, int flags, int (*errfunc)(const char *path, int err), struct match **tail)
+ {
+-	DIR *dir;
+-	struct dirent de_buf, *de;
+-	char pat[strlen(p)+1];
+-	char *p2;
+-	size_t l = strlen(d);
+-	int literal;
+-	int fnm_flags= ((flags & GLOB_NOESCAPE) ? FNM_NOESCAPE : 0)
+-		| ((!(flags & GLOB_PERIOD)) ? FNM_PERIOD : 0);
+-	int error;
+-
+-	if ((p2 = strchr(p, '/'))) {
+-		strcpy(pat, p);
+-		pat[p2-p] = 0;
+-		for (; *p2 == '/'; p2++);
+-		p = pat;
++	/* If GLOB_MARK is unused, we don't care about type. */
++	if (!type && !(flags & GLOB_MARK)) type = DT_REG;
++
++	/* Special-case the remaining pattern being all slashes, in
++	 * which case we can use caller-passed type if it's a dir. */
++	if (*pat && type!=DT_DIR) type = 0;
++	while (pos+1 < PATH_MAX && *pat=='/') buf[pos++] = *pat++;
++
++	/* Consume maximal [escaped-]literal prefix of pattern, copying
++	 * and un-escaping it to the running buffer as we go. */
++	ptrdiff_t i=0, j=0;
++	int in_bracket = 0, overflow = 0;
++	for (; pat[i]!='*' && pat[i]!='?' && (!in_bracket || pat[i]!=']'); i++) {
++		if (!pat[i]) {
++			if (overflow) return 0;
++			pat += i;
++			pos += j;
++			i = j = 0;
++			break;
++		} else if (pat[i] == '[') {
++			in_bracket = 1;
++		} else if (pat[i] == '/') {
++			if (overflow) return 0;
++			in_bracket = 0;
++			pat += i+1;
++			i = -1;
++			pos += j+1;
++			j = -1;
++		} else if (pat[i] == '\\' && !(flags & GLOB_NOESCAPE)) {
++			/* Backslashes inside a bracket are (at least by
++			 * our interpretation) non-special, so if next
++			 * char is ']' we have a complete expression. */
++			if (in_bracket && pat[i+1]==']') break;
++			/* Unpaired final backslash never matches. */
++			if (!pat[i+1] || pat[i+1]=='/') return 0;
++			i++;
++		}
++		/* Only store a character if it fits in the buffer, but if
++		 * a potential bracket expression is open, the overflow
++		 * must be remembered and handled later only if the bracket
++		 * is unterminated (and thereby a literal), so as not to
++		 * disallow long bracket expressions with short matches. */
++		if (pos+(j+1) < PATH_MAX) {
++			buf[pos+j++] = pat[i];
++		} else if (in_bracket) {
++			overflow = 1;
++		} else {
++			return 0;
++		}
++		/* If we consume any new components, the caller-passed type
++		 * or dummy type from above is no longer valid. */
++		type = 0;
+ 	}
+-	literal = is_literal(p, !(flags & GLOB_NOESCAPE));
+-	if (*d == '/' && !*(d+1)) l = 0;
+-
+-	/* rely on opendir failing for nondirectory objects */
+-	dir = opendir(*d ? d : ".");
+-	error = errno;
+-	if (!dir) {
+-		/* this is not an error -- we let opendir call stat for us */
+-		if (error == ENOTDIR) return 0;
+-		if (error == EACCES && !*p) {
+-			struct stat st;
+-			if (!stat(d, &st) && S_ISDIR(st.st_mode)) {
+-				if (append(tail, d, l, l))
+-					return GLOB_NOSPACE;
+-				return 0;
+-			}
++	buf[pos] = 0;
++	if (!*pat) {
++		/* If we consumed any components above, or if GLOB_MARK is
++		 * requested and we don't yet know if the match is a dir,
++		 * we must call stat to confirm the file exists and/or
++		 * determine its type. */
++		struct stat st;
++		if ((flags & GLOB_MARK) && type==DT_LNK) type = 0;
++		if (!type && stat(buf, &st)) {
++			if (errno!=ENOENT && (errfunc(buf, errno) || (flags & GLOB_ERR)))
++				return GLOB_ABORTED;
++			return 0;
+ 		}
+-		if (errfunc(d, error) || (flags & GLOB_ERR))
+-			return GLOB_ABORTED;
++		if (!type && S_ISDIR(st.st_mode)) type = DT_DIR;
++		if (append(tail, buf, pos, (flags & GLOB_MARK) && type==DT_DIR))
++			return GLOB_NOSPACE;
+ 		return 0;
+ 	}
+-	if (!*p) {
+-		error = append(tail, d, l, l) ? GLOB_NOSPACE : 0;
+-		closedir(dir);
+-		return error;
++	char *p2 = strchr(pat, '/');
++	DIR *dir = opendir(pos ? buf : ".");
++	if (!dir) {
++		if (errfunc(buf, errno) || (flags & GLOB_ERR))
++			return GLOB_ABORTED;
++		return 0;
+ 	}
+-	while (!(error = readdir_r(dir, &de_buf, &de)) && de) {
+-		char namebuf[l+de->d_reclen+2], *name = namebuf;
+-		if (!literal && fnmatch(p, de->d_name, fnm_flags))
++	int old_errno = errno;
++	struct dirent *de;
++	while (errno=0, de=readdir(dir)) {
++		/* Quickly skip non-directories when there's pattern left. */
++		if (p2 && de->d_type && de->d_type!=DT_DIR && de->d_type!=DT_LNK)
+ 			continue;
+-		if (literal && strcmp(p, de->d_name))
+-			continue;
+-		if (p2 && de->d_type && !S_ISDIR(de->d_type<<12) && !S_ISLNK(de->d_type<<12))
++
++		size_t l = strlen(de->d_name);
++		if (l >= PATH_MAX-pos) continue;
++
++		if (p2) *p2 = 0;
++
++		int fnm_flags= ((flags & GLOB_NOESCAPE) ? FNM_NOESCAPE : 0)
++			| ((!(flags & GLOB_PERIOD)) ? FNM_PERIOD : 0);
++
++		if (fnmatch(pat, de->d_name, fnm_flags))
+ 			continue;
++
+ 		/* With GLOB_PERIOD, don't allow matching . or .. unless
+ 		 * fnmatch would match them with FNM_PERIOD rules in effect. */
+ 		if (p2 && (flags & GLOB_PERIOD) && de->d_name[0]=='.'
+ 		    && (!de->d_name[1] || de->d_name[1]=='.' && !de->d_name[2])
+-		    && fnmatch(p, de->d_name, fnm_flags | FNM_PERIOD))
++		    && fnmatch(pat, de->d_name, fnm_flags | FNM_PERIOD))
+ 			continue;
+-		if (*d) {
+-			memcpy(name, d, l);
+-			name[l] = '/';
+-			strcpy(name+l+1, de->d_name);
+-		} else {
+-			name = de->d_name;
+-		}
+-		if (p2) {
+-			if ((error = match_in_dir(name, p2, flags, errfunc, tail))) {
+-				closedir(dir);
+-				return error;
+-			}
+-		} else {
+-			int mark = 0;
+-			if (flags & GLOB_MARK) {
+-				if (de->d_type && !S_ISLNK(de->d_type<<12))
+-					mark = S_ISDIR(de->d_type<<12);
+-				else {
+-					struct stat st;
+-					stat(name, &st);
+-					mark = S_ISDIR(st.st_mode);
+-				}
+-			}
+-			if (append(tail, name, l+de->d_reclen+1, mark)) {
+-				closedir(dir);
+-				return GLOB_NOSPACE;
+-			}
++
++		memcpy(buf+pos, de->d_name, l+1);
++		if (p2) *p2 = '/';
++		int r = do_glob(buf, pos+l, de->d_type, p2 ? p2 : "", flags, errfunc, tail);
++		if (r) {
++			closedir(dir);
++			return r;
+ 		}
+ 	}
++	int readerr = errno;
++	if (p2) *p2 = '/';
+ 	closedir(dir);
+-	if (error && (errfunc(d, error) || (flags & GLOB_ERR)))
++	if (readerr && (errfunc(buf, errno) || (flags & GLOB_ERR)))
+ 		return GLOB_ABORTED;
++	errno = old_errno;
+ 	return 0;
+ }
+ 
+@@ -164,19 +173,12 @@ static int sort(const void *a, const void *b)
+ 
+ int glob(const char *restrict pat, int flags, int (*errfunc)(const char *path, int err), glob_t *restrict g)
+ {
+-	const char *p=pat, *d;
+ 	struct match head = { .next = NULL }, *tail = &head;
+ 	size_t cnt, i;
+ 	size_t offs = (flags & GLOB_DOOFFS) ? g->gl_offs : 0;
+ 	int error = 0;
++	char buf[PATH_MAX];
+ 	
+-	if (*p == '/') {
+-		for (; *p == '/'; p++);
+-		d = "/";
+-	} else {
+-		d = "";
+-	}
+-
+ 	if (!errfunc) errfunc = ignore_err;
+ 
+ 	if (!(flags & GLOB_APPEND)) {
+@@ -185,9 +187,14 @@ int glob(const char *restrict pat, int flags, int (*errfunc)(const char *path, i
+ 		g->gl_pathv = NULL;
+ 	}
+ 
+-	if (strnlen(p, PATH_MAX+1) > PATH_MAX) return GLOB_NOSPACE;
++	if (*pat) {
++		char *p = strdup(pat);
++		if (!p) return GLOB_NOSPACE;
++		buf[0] = 0;
++		error = do_glob(buf, 0, 0, p, flags, errfunc, &tail);
++		free(p);
++	}
+ 
+-	if (*pat) error = match_in_dir(d, p, flags, errfunc, &tail);
+ 	if (error == GLOB_NOSPACE) {
+ 		freelist(&head);
+ 		return error;
+-- 
+2.18.1
+
+
+From 481006fd8887b80c4f794085179047e28102b01a Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Sat, 13 Oct 2018 00:55:48 -0400
+Subject: [PATCH 11/46] allow escaped path-separator slashes in glob
+
+previously (before and after rewrite), spurious escaping of path
+separators as \/ was not treated the same as /, but rather got split
+as an unpaired \ at the end of the fnmatch pattern and an unescaped /,
+resulting in a mismatch/error.
+
+for the case of \/ as part of the maximal literal prefix, remove the
+explicit rejection of it and move the handling of / below escape
+processing.
+
+for the case of \/ after a proper glob pattern, it's hard to parse the
+pattern, so don't. instead cheat and count repetitions of \ prior to
+the already-found / character. if there are an odd number, the last is
+escaping the /, so back up the split position by one. now the
+char clobbered by null termination is variable, so save it and restore
+as needed.
+---
+ src/regex/glob.c | 33 ++++++++++++++++++++++-----------
+ 1 file changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/src/regex/glob.c b/src/regex/glob.c
+index 751b6966..aa1c6a44 100644
+--- a/src/regex/glob.c
++++ b/src/regex/glob.c
+@@ -53,22 +53,23 @@ static int do_glob(char *buf, size_t pos, int type, char *pat, int flags, int (*
+ 			break;
+ 		} else if (pat[i] == '[') {
+ 			in_bracket = 1;
+-		} else if (pat[i] == '/') {
+-			if (overflow) return 0;
+-			in_bracket = 0;
+-			pat += i+1;
+-			i = -1;
+-			pos += j+1;
+-			j = -1;
+ 		} else if (pat[i] == '\\' && !(flags & GLOB_NOESCAPE)) {
+ 			/* Backslashes inside a bracket are (at least by
+ 			 * our interpretation) non-special, so if next
+ 			 * char is ']' we have a complete expression. */
+ 			if (in_bracket && pat[i+1]==']') break;
+ 			/* Unpaired final backslash never matches. */
+-			if (!pat[i+1] || pat[i+1]=='/') return 0;
++			if (!pat[i+1]) return 0;
+ 			i++;
+ 		}
++		if (pat[i] == '/') {
++			if (overflow) return 0;
++			in_bracket = 0;
++			pat += i+1;
++			i = -1;
++			pos += j+1;
++			j = -1;
++		}
+ 		/* Only store a character if it fits in the buffer, but if
+ 		 * a potential bracket expression is open, the overflow
+ 		 * must be remembered and handled later only if the bracket
+@@ -103,7 +104,17 @@ static int do_glob(char *buf, size_t pos, int type, char *pat, int flags, int (*
+ 			return GLOB_NOSPACE;
+ 		return 0;
+ 	}
+-	char *p2 = strchr(pat, '/');
++	char *p2 = strchr(pat, '/'), saved_sep = '/';
++	/* Check if the '/' was escaped and, if so, remove the escape char
++	 * so that it will not be unpaired when passed to fnmatch. */
++	if (p2 && !(flags & GLOB_NOESCAPE)) {
++		char *p;
++		for (p=p2; p>pat && p[-1]=='\\'; p--);
++		if ((p2-p)%2) {
++			p2--;
++			saved_sep = '\\';
++		}
++	}
+ 	DIR *dir = opendir(pos ? buf : ".");
+ 	if (!dir) {
+ 		if (errfunc(buf, errno) || (flags & GLOB_ERR))
+@@ -136,7 +147,7 @@ static int do_glob(char *buf, size_t pos, int type, char *pat, int flags, int (*
+ 			continue;
+ 
+ 		memcpy(buf+pos, de->d_name, l+1);
+-		if (p2) *p2 = '/';
++		if (p2) *p2 = saved_sep;
+ 		int r = do_glob(buf, pos+l, de->d_type, p2 ? p2 : "", flags, errfunc, tail);
+ 		if (r) {
+ 			closedir(dir);
+@@ -144,7 +155,7 @@ static int do_glob(char *buf, size_t pos, int type, char *pat, int flags, int (*
+ 		}
+ 	}
+ 	int readerr = errno;
+-	if (p2) *p2 = '/';
++	if (p2) *p2 = saved_sep;
+ 	closedir(dir);
+ 	if (readerr && (errfunc(buf, errno) || (flags & GLOB_ERR)))
+ 		return GLOB_ABORTED;
+-- 
+2.18.1
+
+
+From 1da534ada8a66424e0d23e94ab6750b689be6d64 Mon Sep 17 00:00:00 2001
+From: Szabolcs Nagy <nsz@port70.net>
+Date: Thu, 13 Sep 2018 22:35:13 +0000
+Subject: [PATCH 12/46] s390x: add single instruction fma and fmaf
+
+These are available in the s390x baseline isa -march=z900.
+---
+ src/math/s390x/fma.c  | 7 +++++++
+ src/math/s390x/fmaf.c | 7 +++++++
+ 2 files changed, 14 insertions(+)
+ create mode 100644 src/math/s390x/fma.c
+ create mode 100644 src/math/s390x/fmaf.c
+
+diff --git a/src/math/s390x/fma.c b/src/math/s390x/fma.c
+new file mode 100644
+index 00000000..86da0e49
+--- /dev/null
++++ b/src/math/s390x/fma.c
+@@ -0,0 +1,7 @@
++#include <math.h>
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("madbr %0, %1, %2" : "+f"(z) : "f"(x), "f"(y));
++	return z;
++}
+diff --git a/src/math/s390x/fmaf.c b/src/math/s390x/fmaf.c
+new file mode 100644
+index 00000000..f1aec6ad
+--- /dev/null
++++ b/src/math/s390x/fmaf.c
+@@ -0,0 +1,7 @@
++#include <math.h>
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("maebr %0, %1, %2" : "+f"(z) : "f"(x), "f"(y));
++	return z;
++}
+-- 
+2.18.1
+
+
+From 7c5f3bb955123ba65bbdedee0e4499ef78a5747c Mon Sep 17 00:00:00 2001
+From: Szabolcs Nagy <nsz@port70.net>
+Date: Thu, 20 Sep 2018 23:14:11 +0000
+Subject: [PATCH 13/46] powerpc: add single instruction fabs, fabsf, fma, fmaf,
+ sqrt, sqrtf
+
+These are only available on hard float target and sqrt is not available
+in the base ISA, so further check is used.
+---
+ src/math/powerpc/fabs.c  | 15 +++++++++++++++
+ src/math/powerpc/fabsf.c | 15 +++++++++++++++
+ src/math/powerpc/fma.c   | 15 +++++++++++++++
+ src/math/powerpc/fmaf.c  | 15 +++++++++++++++
+ src/math/powerpc/sqrt.c  | 15 +++++++++++++++
+ src/math/powerpc/sqrtf.c | 15 +++++++++++++++
+ 6 files changed, 90 insertions(+)
+ create mode 100644 src/math/powerpc/fabs.c
+ create mode 100644 src/math/powerpc/fabsf.c
+ create mode 100644 src/math/powerpc/fma.c
+ create mode 100644 src/math/powerpc/fmaf.c
+ create mode 100644 src/math/powerpc/sqrt.c
+ create mode 100644 src/math/powerpc/sqrtf.c
+
+diff --git a/src/math/powerpc/fabs.c b/src/math/powerpc/fabs.c
+new file mode 100644
+index 00000000..f6ec4433
+--- /dev/null
++++ b/src/math/powerpc/fabs.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#ifdef _SOFT_FLOAT
++
++#include "../fabs.c"
++
++#else
++
++double fabs(double x)
++{
++	__asm__ ("fabs %0, %1" : "=d"(x) : "d"(x));
++	return x;
++}
++
++#endif
+diff --git a/src/math/powerpc/fabsf.c b/src/math/powerpc/fabsf.c
+new file mode 100644
+index 00000000..d88b5911
+--- /dev/null
++++ b/src/math/powerpc/fabsf.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#ifdef _SOFT_FLOAT
++
++#include "../fabsf.c"
++
++#else
++
++float fabsf(float x)
++{
++	__asm__ ("fabs %0, %1" : "=f"(x) : "f"(x));
++	return x;
++}
++
++#endif
+diff --git a/src/math/powerpc/fma.c b/src/math/powerpc/fma.c
+new file mode 100644
+index 00000000..fd268f5f
+--- /dev/null
++++ b/src/math/powerpc/fma.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#ifdef _SOFT_FLOAT
++
++#include "../fma.c"
++
++#else
++
++double fma(double x, double y, double z)
++{
++	__asm__("fmadd %0, %1, %2, %3" : "=d"(x) : "d"(x), "d"(y), "d"(z));
++	return x;
++}
++
++#endif
+diff --git a/src/math/powerpc/fmaf.c b/src/math/powerpc/fmaf.c
+new file mode 100644
+index 00000000..a99a2a3b
+--- /dev/null
++++ b/src/math/powerpc/fmaf.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#ifdef _SOFT_FLOAT
++
++#include "../fmaf.c"
++
++#else
++
++float fmaf(float x, float y, float z)
++{
++	__asm__("fmadds %0, %1, %2, %3" : "=f"(x) : "f"(x), "f"(y), "f"(z));
++	return x;
++}
++
++#endif
+diff --git a/src/math/powerpc/sqrt.c b/src/math/powerpc/sqrt.c
+new file mode 100644
+index 00000000..8718dbd0
+--- /dev/null
++++ b/src/math/powerpc/sqrt.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#if !defined _SOFT_FLOAT && defined _ARCH_PPCSQ
++
++double sqrt(double x)
++{
++	__asm__ ("fsqrt %0, %1\n" : "=d" (x) : "d" (x));
++	return x;
++}
++
++#else
++
++#include "../sqrt.c"
++
++#endif
+diff --git a/src/math/powerpc/sqrtf.c b/src/math/powerpc/sqrtf.c
+new file mode 100644
+index 00000000..3431b672
+--- /dev/null
++++ b/src/math/powerpc/sqrtf.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#if !defined _SOFT_FLOAT && defined _ARCH_PPCSQ
++
++float sqrtf(float x)
++{
++	__asm__ ("fsqrts %0, %1\n" : "=f" (x) : "f" (x));
++	return x;
++}
++
++#else
++
++#include "../sqrtf.c"
++
++#endif
+-- 
+2.18.1
+
+
+From 7396ef0a05b834bf92c4f268a3336c0bc10c3593 Mon Sep 17 00:00:00 2001
+From: Szabolcs Nagy <nsz@port70.net>
+Date: Sat, 22 Sep 2018 18:47:27 +0000
+Subject: [PATCH 14/46] arm: add single instruction fma
+
+vfma is available in the vfpv4 fpu and above, the ACLE standard feature
+test for double precision hardware fma support is
+  __ARM_FEATURE_FMA && __ARM_FP&8
+we need further checks to work around clang bugs (fixed in clang >=7.0)
+  && !__SOFTFP__
+because __ARM_FP is defined even with -mfloat-abi=soft
+  && !BROKEN_VFP_ASM
+to disable the single precision code when inline asm handling is broken.
+
+For runtime selection the HWCAP_ARM_VFPv4 hwcap flag can be used, but
+that requires further work.
+---
+ src/math/arm/fma.c  | 15 +++++++++++++++
+ src/math/arm/fmaf.c | 15 +++++++++++++++
+ 2 files changed, 30 insertions(+)
+ create mode 100644 src/math/arm/fma.c
+ create mode 100644 src/math/arm/fmaf.c
+
+diff --git a/src/math/arm/fma.c b/src/math/arm/fma.c
+new file mode 100644
+index 00000000..2a9b8efa
+--- /dev/null
++++ b/src/math/arm/fma.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#if __ARM_FEATURE_FMA && __ARM_FP&8 && !__SOFTFP__
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("vfma.f64 %P0, %P1, %P2" : "+w"(z) : "w"(x), "w"(y));
++	return z;
++}
++
++#else
++
++#include "../fma.c"
++
++#endif
+diff --git a/src/math/arm/fmaf.c b/src/math/arm/fmaf.c
+new file mode 100644
+index 00000000..a1793d27
+--- /dev/null
++++ b/src/math/arm/fmaf.c
+@@ -0,0 +1,15 @@
++#include <math.h>
++
++#if __ARM_FEATURE_FMA && __ARM_FP&4 && !__SOFTFP__ && !BROKEN_VFP_ASM
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("vfma.f32 %0, %1, %2" : "+t"(z) : "t"(x), "t"(y));
++	return z;
++}
++
++#else
++
++#include "../fmaf.c"
++
++#endif
+-- 
+2.18.1
+
+
+From e9016138886527a739804634048aeac16092dc1e Mon Sep 17 00:00:00 2001
+From: Szabolcs Nagy <nsz@port70.net>
+Date: Sat, 22 Sep 2018 21:43:42 +0000
+Subject: [PATCH 15/46] x86_64: add single instruction fma
+
+fma is only available on recent x86_64 cpus and it is much faster than
+a software fma, so this should be done with a runtime check, however
+that requires more changes, this patch just adds the code so it can be
+tested when musl is compiled with -mfma or -mfma4.
+---
+ src/math/x32/fma.c     | 23 +++++++++++++++++++++++
+ src/math/x32/fmaf.c    | 23 +++++++++++++++++++++++
+ src/math/x86_64/fma.c  | 23 +++++++++++++++++++++++
+ src/math/x86_64/fmaf.c | 23 +++++++++++++++++++++++
+ 4 files changed, 92 insertions(+)
+ create mode 100644 src/math/x32/fma.c
+ create mode 100644 src/math/x32/fmaf.c
+ create mode 100644 src/math/x86_64/fma.c
+ create mode 100644 src/math/x86_64/fmaf.c
+
+diff --git a/src/math/x32/fma.c b/src/math/x32/fma.c
+new file mode 100644
+index 00000000..4dd53f2a
+--- /dev/null
++++ b/src/math/x32/fma.c
+@@ -0,0 +1,23 @@
++#include <math.h>
++
++#if __FMA__
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("vfmadd132sd %1, %2, %0" : "+x" (x) : "x" (y), "x" (z));
++	return x;
++}
++
++#elif __FMA4__
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("vfmaddsd %3, %2, %1, %0" : "=x" (x) : "x" (x), "x" (y), "x" (z));
++	return x;
++}
++
++#else
++
++#include "../fma.c"
++
++#endif
+diff --git a/src/math/x32/fmaf.c b/src/math/x32/fmaf.c
+new file mode 100644
+index 00000000..30b971ff
+--- /dev/null
++++ b/src/math/x32/fmaf.c
+@@ -0,0 +1,23 @@
++#include <math.h>
++
++#if __FMA__
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("vfmadd132ss %1, %2, %0" : "+x" (x) : "x" (y), "x" (z));
++	return x;
++}
++
++#elif __FMA4__
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("vfmaddss %3, %2, %1, %0" : "=x" (x) : "x" (x), "x" (y), "x" (z));
++	return x;
++}
++
++#else
++
++#include "../fmaf.c"
++
++#endif
+diff --git a/src/math/x86_64/fma.c b/src/math/x86_64/fma.c
+new file mode 100644
+index 00000000..4dd53f2a
+--- /dev/null
++++ b/src/math/x86_64/fma.c
+@@ -0,0 +1,23 @@
++#include <math.h>
++
++#if __FMA__
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("vfmadd132sd %1, %2, %0" : "+x" (x) : "x" (y), "x" (z));
++	return x;
++}
++
++#elif __FMA4__
++
++double fma(double x, double y, double z)
++{
++	__asm__ ("vfmaddsd %3, %2, %1, %0" : "=x" (x) : "x" (x), "x" (y), "x" (z));
++	return x;
++}
++
++#else
++
++#include "../fma.c"
++
++#endif
+diff --git a/src/math/x86_64/fmaf.c b/src/math/x86_64/fmaf.c
+new file mode 100644
+index 00000000..30b971ff
+--- /dev/null
++++ b/src/math/x86_64/fmaf.c
+@@ -0,0 +1,23 @@
++#include <math.h>
++
++#if __FMA__
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("vfmadd132ss %1, %2, %0" : "+x" (x) : "x" (y), "x" (z));
++	return x;
++}
++
++#elif __FMA4__
++
++float fmaf(float x, float y, float z)
++{
++	__asm__ ("vfmaddss %3, %2, %1, %0" : "=x" (x) : "x" (x), "x" (y), "x" (z));
++	return x;
++}
++
++#else
++
++#include "../fmaf.c"
++
++#endif
+-- 
+2.18.1
+
+
+From b36c37f6fa9692b03bbdeda2b57b2e8a26d8f315 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 15 Oct 2018 15:31:02 -0400
+Subject: [PATCH 16/46] fix misleading placement of statement on same line as
+ for loop in ldso
+
+the placement triggered -Wmisleading-indentation warnings if enabled,
+and was gratuitously confusing to anyone reading the code.
+---
+ ldso/dynlink.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+index 42b078cf..c2447bc9 100644
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -1410,7 +1410,8 @@ hidden void __dls2(unsigned char *base, size_t *sp)
+ 		void *p2 = (void *)sp[-1];
+ 		if (!p1) {
+ 			size_t *auxv, aux[AUX_CNT];
+-			for (auxv=sp+1+*sp+1; *auxv; auxv++); auxv++;
++			for (auxv=sp+1+*sp+1; *auxv; auxv++);
++			auxv++;
+ 			decode_vec(auxv, aux, AUX_CNT);
+ 			if (aux[AT_BASE]) ldso.base = (void *)aux[AT_BASE];
+ 			else ldso.base = (void *)(aux[AT_PHDR] & -4096);
+-- 
+2.18.1
+
+
+From 2085378a4fad15f65686d78f52dc6fb5362bdf20 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 00:59:43 -0400
+Subject: [PATCH 17/46] move stdio locking MAYBE_WAITERS definition to
+ stdio_impl.h
+
+don't repeat definition in two places.
+---
+ src/internal/stdio_impl.h | 2 ++
+ src/stdio/__lockfile.c    | 2 --
+ src/stdio/ftrylockfile.c  | 2 --
+ 3 files changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/src/internal/stdio_impl.h b/src/internal/stdio_impl.h
+index 8c81fd53..ab34da2a 100644
+--- a/src/internal/stdio_impl.h
++++ b/src/internal/stdio_impl.h
+@@ -94,6 +94,8 @@ hidden void __register_locked_file(FILE *, struct __pthread *);
+ hidden void __unlist_locked_file(FILE *);
+ hidden void __do_orphaned_stdio_locks(void);
+ 
++#define MAYBE_WAITERS 0x40000000
++
+ hidden void __getopt_msg(const char *, const char *, const char *, size_t);
+ 
+ #define feof(f) ((f)->flags & F_EOF)
+diff --git a/src/stdio/__lockfile.c b/src/stdio/__lockfile.c
+index 0dcb2a42..0f60a149 100644
+--- a/src/stdio/__lockfile.c
++++ b/src/stdio/__lockfile.c
+@@ -1,8 +1,6 @@
+ #include "stdio_impl.h"
+ #include "pthread_impl.h"
+ 
+-#define MAYBE_WAITERS 0x40000000
+-
+ int __lockfile(FILE *f)
+ {
+ 	int owner = f->lock, tid = __pthread_self()->tid;
+diff --git a/src/stdio/ftrylockfile.c b/src/stdio/ftrylockfile.c
+index 3b97807a..50650585 100644
+--- a/src/stdio/ftrylockfile.c
++++ b/src/stdio/ftrylockfile.c
+@@ -2,8 +2,6 @@
+ #include "pthread_impl.h"
+ #include <limits.h>
+ 
+-#define MAYBE_WAITERS 0x40000000
+-
+ void __do_orphaned_stdio_locks()
+ {
+ 	FILE *f;
+-- 
+2.18.1
+
+
+From 1c84c99913bf1cd47b866ed31e665848a0da84a2 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 13:36:51 -0400
+Subject: [PATCH 18/46] add new stage 2b to dynamic linker bootstrap for thread
+ pointer
+
+commit a603a75a72bb469c6be4963ed1b55fabe675fe15 removed attribute
+const from __errno_location and pthread_self, and the same reasoning
+forced arch definitions of __pthread_self to use volatile asm,
+significantly impacting code generation and imposing manual caching of
+pointers where the impact might be noticable.
+
+reorder the thread pointer setup and place it across a strong barrier
+(symbolic function lookup) so that there is no assumed ordering
+between the initialization and the accesses to the thread pointer in
+stage 3.
+---
+ ldso/dynlink.c | 33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/ldso/dynlink.c b/ldso/dynlink.c
+index c2447bc9..ec921dfd 100644
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -1453,9 +1453,31 @@ hidden void __dls2(unsigned char *base, size_t *sp)
+ 
+ 	ldso.relocated = 0;
+ 
+-	/* Call dynamic linker stage-3, __dls3, looking it up
++	/* Call dynamic linker stage-2b, __dls2b, looking it up
+ 	 * symbolically as a barrier against moving the address
+ 	 * load across the above relocation processing. */
++	struct symdef dls2b_def = find_sym(&ldso, "__dls2b", 0);
++	if (DL_FDPIC) ((stage3_func)&ldso.funcdescs[dls2b_def.sym-ldso.syms])(sp);
++	else ((stage3_func)laddr(&ldso, dls2b_def.sym->st_value))(sp);
++}
++
++/* Stage 2b sets up a valid thread pointer, which requires relocations
++ * completed in stage 2, and on which stage 3 is permitted to depend.
++ * This is done as a separate stage, with symbolic lookup as a barrier,
++ * so that loads of the thread pointer and &errno can be pure/const and
++ * thereby hoistable. */
++
++_Noreturn void __dls2b(size_t *sp)
++{
++	/* Setup early thread pointer in builtin_tls for ldso/libc itself to
++	 * use during dynamic linking. If possible it will also serve as the
++	 * thread pointer at runtime. */
++	libc.tls_size = sizeof builtin_tls;
++	libc.tls_align = tls_align;
++	if (__init_tp(__copy_tls((void *)builtin_tls)) < 0) {
++		a_crash();
++	}
++
+ 	struct symdef dls3_def = find_sym(&ldso, "__dls3", 0);
+ 	if (DL_FDPIC) ((stage3_func)&ldso.funcdescs[dls3_def.sym-ldso.syms])(sp);
+ 	else ((stage3_func)laddr(&ldso, dls3_def.sym->st_value))(sp);
+@@ -1490,15 +1512,6 @@ _Noreturn void __dls3(size_t *sp)
+ 	libc.secure = ((aux[0]&0x7800)!=0x7800 || aux[AT_UID]!=aux[AT_EUID]
+ 		|| aux[AT_GID]!=aux[AT_EGID] || aux[AT_SECURE]);
+ 
+-	/* Setup early thread pointer in builtin_tls for ldso/libc itself to
+-	 * use during dynamic linking. If possible it will also serve as the
+-	 * thread pointer at runtime. */
+-	libc.tls_size = sizeof builtin_tls;
+-	libc.tls_align = tls_align;
+-	if (__init_tp(__copy_tls((void *)builtin_tls)) < 0) {
+-		a_crash();
+-	}
+-
+ 	/* Only trust user/env if kernel says we're not suid/sgid */
+ 	if (!libc.secure) {
+ 		env_path = getenv("LD_LIBRARY_PATH");
+-- 
+2.18.1
+
+
+From bf453d68393f7eea5965319e21311e56d71fa53c Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 13:48:10 -0400
+Subject: [PATCH 19/46] restore attribute((const)) to pthread_self and errno
+ location decls
+
+revert commit a603a75a72bb469c6be4963ed1b55fabe675fe15.
+
+as a result of commit 1c84c99913bf1cd47b866ed31e665848a0da84a2 this is
+now safe, assuming an interpretation of the somewhat-underspecified
+attribute((const)) consistent with real-world usage.
+---
+ include/errno.h   | 3 +++
+ include/netdb.h   | 3 +++
+ include/pthread.h | 3 +++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/include/errno.h b/include/errno.h
+index 93f5f6ec..0361b33a 100644
+--- a/include/errno.h
++++ b/include/errno.h
+@@ -9,6 +9,9 @@ extern "C" {
+ 
+ #include <bits/errno.h>
+ 
++#ifdef __GNUC__
++__attribute__((const))
++#endif
+ int *__errno_location(void);
+ #define errno (*__errno_location())
+ 
+diff --git a/include/netdb.h b/include/netdb.h
+index adde2c5e..d096c781 100644
+--- a/include/netdb.h
++++ b/include/netdb.h
+@@ -115,6 +115,9 @@ struct protoent *getprotobynumber (int);
+  || (defined(_XOPEN_SOURCE) && _XOPEN_SOURCE+0 < 700)
+ struct hostent *gethostbyname (const char *);
+ struct hostent *gethostbyaddr (const void *, socklen_t, int);
++#ifdef __GNUC__
++__attribute__((const))
++#endif
+ int *__h_errno_location(void);
+ #define h_errno (*__h_errno_location())
+ #define HOST_NOT_FOUND 1
+diff --git a/include/pthread.h b/include/pthread.h
+index bba9587e..e238321b 100644
+--- a/include/pthread.h
++++ b/include/pthread.h
+@@ -79,6 +79,9 @@ int pthread_detach(pthread_t);
+ _Noreturn void pthread_exit(void *);
+ int pthread_join(pthread_t, void **);
+ 
++#ifdef __GNUC__
++__attribute__((const))
++#endif
+ pthread_t pthread_self(void);
+ 
+ int pthread_equal(pthread_t, pthread_t);
+-- 
+2.18.1
+
+
+From 7f01a734feddaabf366bc644c926e675656cab62 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 13:55:55 -0400
+Subject: [PATCH 20/46] remove ancient clang workaround from powerpc
+ pthread_arch.h asm
+
+versions of clang all the way back to 3.1 lack the bug this was
+purportedly working around.
+---
+ arch/powerpc/pthread_arch.h | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/arch/powerpc/pthread_arch.h b/arch/powerpc/pthread_arch.h
+index 79e5a09f..bab2e6ca 100644
+--- a/arch/powerpc/pthread_arch.h
++++ b/arch/powerpc/pthread_arch.h
+@@ -1,12 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+-#ifdef __clang__
+-	char *tp;
+-	__asm__ __volatile__ ("mr %0, 2" : "=r"(tp) : : );
+-#else
+ 	register char *tp __asm__("r2");
+ 	__asm__ __volatile__ ("" : "=r" (tp) );
+-#endif
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+                         
+-- 
+2.18.1
+
+
+From a4a3e4dbc086eb58e5cf6118480ef4825788e231 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 14:08:01 -0400
+Subject: [PATCH 21/46] make thread-pointer-loading asm non-volatile
+
+this will allow the compiler to cache and reuse the result, meaning we
+no longer have to take care not to load it more than once for the sake
+of archs where the load may be expensive.
+
+depends on commit 1c84c99913bf1cd47b866ed31e665848a0da84a2 for
+correctness, since otherwise the compiler could hoist loads during
+stage 3 of dynamic linking before the initial thread-pointer setup.
+---
+ arch/aarch64/pthread_arch.h    | 2 +-
+ arch/arm/pthread_arch.h        | 4 ++--
+ arch/i386/pthread_arch.h       | 2 +-
+ arch/microblaze/pthread_arch.h | 2 +-
+ arch/mips/pthread_arch.h       | 4 ++--
+ arch/mips64/pthread_arch.h     | 4 ++--
+ arch/mipsn32/pthread_arch.h    | 4 ++--
+ arch/or1k/pthread_arch.h       | 4 ++--
+ arch/powerpc/pthread_arch.h    | 2 +-
+ arch/powerpc64/pthread_arch.h  | 2 +-
+ arch/s390x/pthread_arch.h      | 2 +-
+ arch/sh/pthread_arch.h         | 2 +-
+ arch/x32/pthread_arch.h        | 2 +-
+ arch/x86_64/pthread_arch.h     | 2 +-
+ 14 files changed, 19 insertions(+), 19 deletions(-)
+
+diff --git a/arch/aarch64/pthread_arch.h b/arch/aarch64/pthread_arch.h
+index e8499d8e..e64b126d 100644
+--- a/arch/aarch64/pthread_arch.h
++++ b/arch/aarch64/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	char *self;
+-	__asm__ __volatile__ ("mrs %0,tpidr_el0" : "=r"(self));
++	__asm__ ("mrs %0,tpidr_el0" : "=r"(self));
+ 	return (void*)(self - sizeof(struct pthread));
+ }
+ 
+diff --git a/arch/arm/pthread_arch.h b/arch/arm/pthread_arch.h
+index 5c6aff28..e689ea21 100644
+--- a/arch/arm/pthread_arch.h
++++ b/arch/arm/pthread_arch.h
+@@ -4,7 +4,7 @@
+ static inline pthread_t __pthread_self()
+ {
+ 	char *p;
+-	__asm__ __volatile__ ( "mrc p15,0,%0,c13,c0,3" : "=r"(p) );
++	__asm__ ( "mrc p15,0,%0,c13,c0,3" : "=r"(p) );
+ 	return (void *)(p-sizeof(struct pthread));
+ }
+ 
+@@ -20,7 +20,7 @@ static inline pthread_t __pthread_self()
+ {
+ 	extern hidden uintptr_t __a_gettp_ptr;
+ 	register uintptr_t p __asm__("r0");
+-	__asm__ __volatile__ ( BLX " %1" : "=r"(p) : "r"(__a_gettp_ptr) : "cc", "lr" );
++	__asm__ ( BLX " %1" : "=r"(p) : "r"(__a_gettp_ptr) : "cc", "lr" );
+ 	return (void *)(p-sizeof(struct pthread));
+ }
+ 
+diff --git a/arch/i386/pthread_arch.h b/arch/i386/pthread_arch.h
+index 7f38a562..6f600b9e 100644
+--- a/arch/i386/pthread_arch.h
++++ b/arch/i386/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	struct pthread *self;
+-	__asm__ __volatile__ ("movl %%gs:0,%0" : "=r" (self) );
++	__asm__ ("movl %%gs:0,%0" : "=r" (self) );
+ 	return self;
+ }
+ 
+diff --git a/arch/microblaze/pthread_arch.h b/arch/microblaze/pthread_arch.h
+index 08d1ba7d..f6ba8de9 100644
+--- a/arch/microblaze/pthread_arch.h
++++ b/arch/microblaze/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	struct pthread *self;
+-	__asm__ __volatile__ ("ori %0, r21, 0" : "=r" (self) );
++	__asm__ ("ori %0, r21, 0" : "=r" (self) );
+ 	return self;
+ }
+ 
+diff --git a/arch/mips/pthread_arch.h b/arch/mips/pthread_arch.h
+index 5fea15ad..1e7839ea 100644
+--- a/arch/mips/pthread_arch.h
++++ b/arch/mips/pthread_arch.h
+@@ -2,10 +2,10 @@ static inline struct pthread *__pthread_self()
+ {
+ #if __mips_isa_rev < 2
+ 	register char *tp __asm__("$3");
+-	__asm__ __volatile__ (".word 0x7c03e83b" : "=r" (tp) );
++	__asm__ (".word 0x7c03e83b" : "=r" (tp) );
+ #else
+ 	char *tp;
+-	__asm__ __volatile__ ("rdhwr %0, $29" : "=r" (tp) );
++	__asm__ ("rdhwr %0, $29" : "=r" (tp) );
+ #endif
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+diff --git a/arch/mips64/pthread_arch.h b/arch/mips64/pthread_arch.h
+index 5fea15ad..1e7839ea 100644
+--- a/arch/mips64/pthread_arch.h
++++ b/arch/mips64/pthread_arch.h
+@@ -2,10 +2,10 @@ static inline struct pthread *__pthread_self()
+ {
+ #if __mips_isa_rev < 2
+ 	register char *tp __asm__("$3");
+-	__asm__ __volatile__ (".word 0x7c03e83b" : "=r" (tp) );
++	__asm__ (".word 0x7c03e83b" : "=r" (tp) );
+ #else
+ 	char *tp;
+-	__asm__ __volatile__ ("rdhwr %0, $29" : "=r" (tp) );
++	__asm__ ("rdhwr %0, $29" : "=r" (tp) );
+ #endif
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+diff --git a/arch/mipsn32/pthread_arch.h b/arch/mipsn32/pthread_arch.h
+index 5fea15ad..1e7839ea 100644
+--- a/arch/mipsn32/pthread_arch.h
++++ b/arch/mipsn32/pthread_arch.h
+@@ -2,10 +2,10 @@ static inline struct pthread *__pthread_self()
+ {
+ #if __mips_isa_rev < 2
+ 	register char *tp __asm__("$3");
+-	__asm__ __volatile__ (".word 0x7c03e83b" : "=r" (tp) );
++	__asm__ (".word 0x7c03e83b" : "=r" (tp) );
+ #else
+ 	char *tp;
+-	__asm__ __volatile__ ("rdhwr %0, $29" : "=r" (tp) );
++	__asm__ ("rdhwr %0, $29" : "=r" (tp) );
+ #endif
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+diff --git a/arch/or1k/pthread_arch.h b/arch/or1k/pthread_arch.h
+index 521b9c53..1b806f89 100644
+--- a/arch/or1k/pthread_arch.h
++++ b/arch/or1k/pthread_arch.h
+@@ -3,10 +3,10 @@ static inline struct pthread *__pthread_self()
+ {
+ #ifdef __clang__
+ 	char *tp;
+-	__asm__ __volatile__ ("l.ori %0, r10, 0" : "=r" (tp) );
++	__asm__ ("l.ori %0, r10, 0" : "=r" (tp) );
+ #else
+ 	register char *tp __asm__("r10");
+-	__asm__ __volatile__ ("" : "=r" (tp) );
++	__asm__ ("" : "=r" (tp) );
+ #endif
+ 	return (struct pthread *) (tp - sizeof(struct pthread));
+ }
+diff --git a/arch/powerpc/pthread_arch.h b/arch/powerpc/pthread_arch.h
+index bab2e6ca..ae0f28d6 100644
+--- a/arch/powerpc/pthread_arch.h
++++ b/arch/powerpc/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	register char *tp __asm__("r2");
+-	__asm__ __volatile__ ("" : "=r" (tp) );
++	__asm__ ("" : "=r" (tp) );
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+                         
+diff --git a/arch/powerpc64/pthread_arch.h b/arch/powerpc64/pthread_arch.h
+index 37b75e29..79c3ecd8 100644
+--- a/arch/powerpc64/pthread_arch.h
++++ b/arch/powerpc64/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	register char *tp __asm__("r13");
+-	__asm__ __volatile__ ("" : "=r" (tp) );
++	__asm__ ("" : "=r" (tp) );
+ 	return (pthread_t)(tp - 0x7000 - sizeof(struct pthread));
+ }
+ 
+diff --git a/arch/s390x/pthread_arch.h b/arch/s390x/pthread_arch.h
+index bd90016d..e2251f1f 100644
+--- a/arch/s390x/pthread_arch.h
++++ b/arch/s390x/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	struct pthread *self;
+-	__asm__ __volatile__ (
++	__asm__ (
+ 		"ear  %0, %%a0\n"
+ 		"sllg %0, %0, 32\n"
+ 		"ear  %0, %%a1\n"
+diff --git a/arch/sh/pthread_arch.h b/arch/sh/pthread_arch.h
+index a7dd27a6..3ee9c1a9 100644
+--- a/arch/sh/pthread_arch.h
++++ b/arch/sh/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	char *self;
+-	__asm__ __volatile__ ("stc gbr,%0" : "=r" (self) );
++	__asm__ ("stc gbr,%0" : "=r" (self) );
+ 	return (struct pthread *) (self - sizeof(struct pthread));
+ }
+ 
+diff --git a/arch/x32/pthread_arch.h b/arch/x32/pthread_arch.h
+index 267ad073..f640a1a1 100644
+--- a/arch/x32/pthread_arch.h
++++ b/arch/x32/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	struct pthread *self;
+-	__asm__ __volatile__ ("mov %%fs:0,%0" : "=r" (self) );
++	__asm__ ("mov %%fs:0,%0" : "=r" (self) );
+ 	return self;
+ }
+ 
+diff --git a/arch/x86_64/pthread_arch.h b/arch/x86_64/pthread_arch.h
+index c61509cf..65e880c6 100644
+--- a/arch/x86_64/pthread_arch.h
++++ b/arch/x86_64/pthread_arch.h
+@@ -1,7 +1,7 @@
+ static inline struct pthread *__pthread_self()
+ {
+ 	struct pthread *self;
+-	__asm__ __volatile__ ("mov %%fs:0,%0" : "=r" (self) );
++	__asm__ ("mov %%fs:0,%0" : "=r" (self) );
+ 	return self;
+ }
+ 
+-- 
+2.18.1
+
+
+From 4390383b32250a941ec616e8bff6f568a801b1c0 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Wed, 17 Oct 2018 22:20:01 -0400
+Subject: [PATCH 22/46] impose barrier between thread pointer setup and use for
+ static linking
+
+this is the analog of commit 1c84c99913bf1cd47b866ed31e665848a0da84a2
+for static linking. unlike with dynamic linking, we don't have
+symbolic lookup to use as a barrier. use a dummy (target-agnostic)
+degenerate inline asm fragment instead. this technique has precedent
+in commit 05ac345f895098657cf44d419b5d572161ebaf43 where it's used for
+explicit_bzero. if it proves problematic in any way, loading the
+address of the stage 2 function from a pointer object whose address
+leaks to kernelspace during thread pointer init could be used as an
+even stronger barrier.
+---
+ src/env/__libc_start_main.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index 58da9e83..ba4d2135 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -63,11 +63,24 @@ static void libc_start_init(void)
+ 
+ weak_alias(libc_start_init, __libc_start_init);
+ 
++static int libc_start_main_stage2(int (*)(int,char **,char **), int, char **);
++
+ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ {
+ 	char **envp = argv+argc+1;
+ 
+ 	__init_libc(envp, argv[0]);
++
++	/* Barrier against hoisting application code or anything using ssp
++	 * or thread pointer prior to its initialization above. */
++	int (*stage2)();
++	__asm__ ( "" : "=r"(stage2) : "r"(libc_start_main_stage2) : "memory" );
++	return stage2(main, argc, argv);
++}
++
++static int libc_start_main_stage2(int (*main)(int,char **,char **), int argc, char **argv)
++{
++	char **envp = argv+argc+1;
+ 	__libc_start_init();
+ 
+ 	/* Pass control to the application */
+-- 
+2.18.1
+
+
+From 7136836e14e5286afe74a354c289601375bd472d Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Wed, 17 Oct 2018 22:28:51 -0400
+Subject: [PATCH 23/46] document and make explicit desired noinline property
+ for __init_libc
+
+on multiple occasions I've started to flatten/inline the code in
+__init_libc, only to rediscover the reason it was not inlined: GCC
+fails to deallocate its stack (and now, with the changes in commit
+4390383b32250a941ec616e8bff6f568a801b1c0, fails to produce a tail call
+to the stage 2 function; see PR #87639) before calling main if it was
+inlined.
+
+document this with a comment and use an explicit noinline attribute if
+__GNUC__ is defined so that even with CFLAGS that heavily favor
+inlining it won't get inlined.
+---
+ src/env/__libc_start_main.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index ba4d2135..2e5f9dcb 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -17,6 +17,9 @@ weak_alias(dummy1, __init_ssp);
+ 
+ #define AUX_CNT 38
+ 
++#ifdef __GNUC__
++__attribute__((__noinline__))
++#endif
+ void __init_libc(char **envp, char *pn)
+ {
+ 	size_t i, *auxv, aux[AUX_CNT] = { 0 };
+@@ -69,6 +72,9 @@ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ {
+ 	char **envp = argv+argc+1;
+ 
++	/* External linkage, and explicit noinline attribute if available,
++	 * are used to prevent the stack frame used during init from
++	 * persisting for the entire process lifetime. */
+ 	__init_libc(envp, argv[0]);
+ 
+ 	/* Barrier against hoisting application code or anything using ssp
+-- 
+2.18.1
+
+
+From dd8f02b7dce53d6b1c4282439f1636a2d63bee01 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Tue, 16 Oct 2018 01:08:21 -0400
+Subject: [PATCH 24/46] optimize hot paths of getc with manual shrink-wrapping
+
+with these changes, in a program that has not created any threads
+besides the main thread and that has not called f[try]lockfile, getc
+performs indistinguishably from getc_unlocked. this was measured on
+several i386 and x86_64 models, and should hold on other archs too
+simply by the properties of the code generation.
+
+the case where the caller already holds the lock (via flockfile) is
+improved significantly as well (40-60% reduction in time on machines
+tested) and the case where locking is needed is improved somewhat
+(roughly 10%).
+
+the key technique used here is forcing the non-hot path out-of-line
+and enabling it to be a tail call. a static noinline function
+(conditional on __GNUC__) is used rather than the extern hiddens used
+elsewhere for this purpose, so that the compiler can choose
+non-default calling conventions, making it possible to tail-call to a
+callee that takes more arguments than the caller on archs where
+arguments are passed on the stack or must have space reserved on the
+stack for spilling the. the tid could just be reloaded via the thread
+pointer in locking_getc, but that would be ridiculously expensive on
+some archs where thread pointer load requires a trap or syscall.
+---
+ src/stdio/fgetc.c   | 10 +++-------
+ src/stdio/getc.c    | 10 +++-------
+ src/stdio/getc.h    | 22 ++++++++++++++++++++++
+ src/stdio/getchar.c |  3 ++-
+ 4 files changed, 30 insertions(+), 15 deletions(-)
+ create mode 100644 src/stdio/getc.h
+
+diff --git a/src/stdio/fgetc.c b/src/stdio/fgetc.c
+index e1224164..2578afcc 100644
+--- a/src/stdio/fgetc.c
++++ b/src/stdio/fgetc.c
+@@ -1,11 +1,7 @@
+-#include "stdio_impl.h"
++#include <stdio.h>
++#include "getc.h"
+ 
+ int fgetc(FILE *f)
+ {
+-	int c;
+-	if (f->lock < 0 || !__lockfile(f))
+-		return getc_unlocked(f);
+-	c = getc_unlocked(f);
+-	__unlockfile(f);
+-	return c;
++	return do_getc(f);
+ }
+diff --git a/src/stdio/getc.c b/src/stdio/getc.c
+index b3f351d1..8409fc23 100644
+--- a/src/stdio/getc.c
++++ b/src/stdio/getc.c
+@@ -1,13 +1,9 @@
+-#include "stdio_impl.h"
++#include <stdio.h>
++#include "getc.h"
+ 
+ int getc(FILE *f)
+ {
+-	int c;
+-	if (f->lock < 0 || !__lockfile(f))
+-		return getc_unlocked(f);
+-	c = getc_unlocked(f);
+-	__unlockfile(f);
+-	return c;
++	return do_getc(f);
+ }
+ 
+ weak_alias(getc, _IO_getc);
+diff --git a/src/stdio/getc.h b/src/stdio/getc.h
+new file mode 100644
+index 00000000..0657ab6f
+--- /dev/null
++++ b/src/stdio/getc.h
+@@ -0,0 +1,22 @@
++#include "stdio_impl.h"
++#include "pthread_impl.h"
++
++#ifdef __GNUC__
++__attribute__((__noinline__))
++#endif
++static int locking_getc(FILE *f, int tid)
++{
++	if (a_cas(&f->lock, 0, tid)) __lockfile(f);
++	int c = getc_unlocked(f);
++	if (a_swap(&f->lock, 0) & MAYBE_WAITERS)
++		__wake(&f->lock, 1, 1);
++	return c;
++}
++
++static inline int do_getc(FILE *f)
++{
++	int tid, l = f->lock;
++	if (l < 0 || (l & ~MAYBE_WAITERS) == (tid=__pthread_self()->tid))
++		return getc_unlocked(f);
++	return locking_getc(f, tid);
++}
+diff --git a/src/stdio/getchar.c b/src/stdio/getchar.c
+index c1012658..df395ca9 100644
+--- a/src/stdio/getchar.c
++++ b/src/stdio/getchar.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
++#include "getc.h"
+ 
+ int getchar(void)
+ {
+-	return fgetc(stdin);
++	return do_getc(stdin);
+ }
+-- 
+2.18.1
+
+
+From d664061adb4d7f6647ab2059bc351daa394bf5da Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Wed, 17 Oct 2018 23:38:29 -0400
+Subject: [PATCH 25/46] optimize hot paths of putc with manual shrink-wrapping
+
+this is the analog of commit dd8f02b7dce53d6b1c4282439f1636a2d63bee01,
+but for putc.
+---
+ src/stdio/fputc.c   | 9 +++------
+ src/stdio/putc.c    | 9 +++------
+ src/stdio/putchar.c | 3 ++-
+ 3 files changed, 8 insertions(+), 13 deletions(-)
+
+diff --git a/src/stdio/fputc.c b/src/stdio/fputc.c
+index 92762c98..f364ed38 100644
+--- a/src/stdio/fputc.c
++++ b/src/stdio/fputc.c
+@@ -1,10 +1,7 @@
+-#include "stdio_impl.h"
++#include <stdio.h>
++#include "putc.h"
+ 
+ int fputc(int c, FILE *f)
+ {
+-	if (f->lock < 0 || !__lockfile(f))
+-		return putc_unlocked(c, f);
+-	c = putc_unlocked(c, f);
+-	__unlockfile(f);
+-	return c;
++	return do_putc(c, f);
+ }
+diff --git a/src/stdio/putc.c b/src/stdio/putc.c
+index fa893496..4744d978 100644
+--- a/src/stdio/putc.c
++++ b/src/stdio/putc.c
+@@ -1,12 +1,9 @@
+-#include "stdio_impl.h"
++#include <stdio.h>
++#include "putc.h"
+ 
+ int putc(int c, FILE *f)
+ {
+-	if (f->lock < 0 || !__lockfile(f))
+-		return putc_unlocked(c, f);
+-	c = putc_unlocked(c, f);
+-	__unlockfile(f);
+-	return c;
++	return do_putc(c, f);
+ }
+ 
+ weak_alias(putc, _IO_putc);
+diff --git a/src/stdio/putchar.c b/src/stdio/putchar.c
+index 945636d5..f044f169 100644
+--- a/src/stdio/putchar.c
++++ b/src/stdio/putchar.c
+@@ -1,6 +1,7 @@
+ #include <stdio.h>
++#include "putc.h"
+ 
+ int putchar(int c)
+ {
+-	return fputc(c, stdout);
++	return do_putc(c, stdout);
+ }
+-- 
+2.18.1
+
+
+From d8f2efa708a027132d443f45a8c98a0c7c1b2d77 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Wed, 17 Oct 2018 23:57:28 -0400
+Subject: [PATCH 26/46] bypass indirection through pointer objects to access
+ stdin/out/err
+
+by ABI, the public stdin/out/err macros use extern pointer objects,
+and this is necessary to avoid copy relocations that would be
+expensive and make the size of the FILE structure part of the ABI.
+however, internally it makes sense to access the underlying FILE
+objects directly. this avoids both an indirection through the GOT to
+find the address of the stdin/out/err pointer objects (which can't be
+computed PC-relative because they may have been moved to the main
+program by copy relocations) and an indirection through the resulting
+pointer object.
+
+in most places this is just a minor optimization, but in the case of
+getchar and putchar (and the unlocked versions thereof), ipa constant
+propagation makes all accesses to members of stdin/out PC-relative or
+GOT-relative, possibly reducing register pressure as well.
+---
+ src/include/stdio.h | 18 ++++++++++++++++++
+ src/stdio/stderr.c  |  8 +++++---
+ src/stdio/stdin.c   |  8 +++++---
+ src/stdio/stdout.c  |  8 +++++---
+ 4 files changed, 33 insertions(+), 9 deletions(-)
+ create mode 100644 src/include/stdio.h
+
+diff --git a/src/include/stdio.h b/src/include/stdio.h
+new file mode 100644
+index 00000000..534c6907
+--- /dev/null
++++ b/src/include/stdio.h
+@@ -0,0 +1,18 @@
++#ifndef STDIO_H
++#define STDIO_H
++
++#include "../../include/stdio.h"
++
++#undef stdin
++#undef stdout
++#undef stderr
++
++extern hidden FILE __stdin_FILE;
++extern hidden FILE __stdout_FILE;
++extern hidden FILE __stderr_FILE;
++
++#define stdin (&__stdin_FILE)
++#define stdout (&__stdout_FILE)
++#define stderr (&__stderr_FILE)
++
++#endif
+diff --git a/src/stdio/stderr.c b/src/stdio/stderr.c
+index 229c8651..f2bc4648 100644
+--- a/src/stdio/stderr.c
++++ b/src/stdio/stderr.c
+@@ -1,7 +1,9 @@
+ #include "stdio_impl.h"
+ 
++#undef stderr
++
+ static unsigned char buf[UNGET];
+-static FILE f = {
++hidden FILE __stderr_FILE = {
+ 	.buf = buf+UNGET,
+ 	.buf_size = 0,
+ 	.fd = 2,
+@@ -12,5 +14,5 @@ static FILE f = {
+ 	.close = __stdio_close,
+ 	.lock = -1,
+ };
+-FILE *const stderr = &f;
+-FILE *volatile __stderr_used = &f;
++FILE *const stderr = &__stderr_FILE;
++FILE *volatile __stderr_used = &__stderr_FILE;
+diff --git a/src/stdio/stdin.c b/src/stdio/stdin.c
+index 171ff22a..5aa5262c 100644
+--- a/src/stdio/stdin.c
++++ b/src/stdio/stdin.c
+@@ -1,7 +1,9 @@
+ #include "stdio_impl.h"
+ 
++#undef stdin
++
+ static unsigned char buf[BUFSIZ+UNGET];
+-static FILE f = {
++hidden FILE __stdin_FILE = {
+ 	.buf = buf+UNGET,
+ 	.buf_size = sizeof buf-UNGET,
+ 	.fd = 0,
+@@ -11,5 +13,5 @@ static FILE f = {
+ 	.close = __stdio_close,
+ 	.lock = -1,
+ };
+-FILE *const stdin = &f;
+-FILE *volatile __stdin_used = &f;
++FILE *const stdin = &__stdin_FILE;
++FILE *volatile __stdin_used = &__stdin_FILE;
+diff --git a/src/stdio/stdout.c b/src/stdio/stdout.c
+index 6b188942..4985a417 100644
+--- a/src/stdio/stdout.c
++++ b/src/stdio/stdout.c
+@@ -1,7 +1,9 @@
+ #include "stdio_impl.h"
+ 
++#undef stdout
++
+ static unsigned char buf[BUFSIZ+UNGET];
+-static FILE f = {
++hidden FILE __stdout_FILE = {
+ 	.buf = buf+UNGET,
+ 	.buf_size = sizeof buf-UNGET,
+ 	.fd = 1,
+@@ -12,5 +14,5 @@ static FILE f = {
+ 	.close = __stdio_close,
+ 	.lock = -1,
+ };
+-FILE *const stdout = &f;
+-FILE *volatile __stdout_used = &f;
++FILE *const stdout = &__stdout_FILE;
++FILE *volatile __stdout_used = &__stdout_FILE;
+-- 
+2.18.1
+
+
+From ab5e1e340890b95e61d7161d7178c6a26247ad61 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 10:43:39 -0400
+Subject: [PATCH 27/46] fix build regression due to missing file for putc
+ changes
+
+commit d664061adb4d7f6647ab2059bc351daa394bf5da inadvertently omitted
+the new file putc.h.
+---
+ src/stdio/putc.h | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+ create mode 100644 src/stdio/putc.h
+
+diff --git a/src/stdio/putc.h b/src/stdio/putc.h
+new file mode 100644
+index 00000000..a37937e8
+--- /dev/null
++++ b/src/stdio/putc.h
+@@ -0,0 +1,22 @@
++#include "stdio_impl.h"
++#include "pthread_impl.h"
++
++#ifdef __GNUC__
++__attribute__((__noinline__))
++#endif
++static int locking_putc(int c, FILE *f, int tid)
++{
++	if (a_cas(&f->lock, 0, tid)) __lockfile(f);
++	c = putc_unlocked(c, f);
++	if (a_swap(&f->lock, 0) & MAYBE_WAITERS)
++		__wake(&f->lock, 1, 1);
++	return c;
++}
++
++static inline int do_putc(int c, FILE *f)
++{
++	int tid, l = f->lock;
++	if (l < 0 || (l & ~MAYBE_WAITERS) == (tid=__pthread_self()->tid))
++		return putc_unlocked(c, f);
++	return locking_putc(c, f, tid);
++}
+-- 
+2.18.1
+
+
+From ba0d83e822b9ea386881feaa1e478114d147bd27 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 11:41:47 -0400
+Subject: [PATCH 28/46] fix error in constraints for static link libc init
+ barrier
+
+commit 4390383b32250a941ec616e8bff6f568a801b1c0 inadvertently used "r"
+instead of "0" for the input constraint, which only happened to work
+for the configuration I tested it on because it usually makes sense
+for the compiler to choose the same input and output register.
+---
+ src/env/__libc_start_main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index 2e5f9dcb..f9aa019d 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -80,7 +80,7 @@ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ 	/* Barrier against hoisting application code or anything using ssp
+ 	 * or thread pointer prior to its initialization above. */
+ 	int (*stage2)();
+-	__asm__ ( "" : "=r"(stage2) : "r"(libc_start_main_stage2) : "memory" );
++	__asm__ ( "" : "=r"(stage2) : "0"(libc_start_main_stage2) : "memory" );
+ 	return stage2(main, argc, argv);
+ }
+ 
+-- 
+2.18.1
+
+
+From 7eda27d025d6d52f855588590366c83d737eb727 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 11:44:49 -0400
+Subject: [PATCH 29/46] use prototype for function pointer in static link libc
+ init barrier
+
+this is not needed for correctness, but doesn't hurt, and in some
+cases the compiler may pessimize the call assuming the callee might be
+variadic when it lacks a prototype.
+---
+ src/env/__libc_start_main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index f9aa019d..b4965d7f 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -79,7 +79,7 @@ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ 
+ 	/* Barrier against hoisting application code or anything using ssp
+ 	 * or thread pointer prior to its initialization above. */
+-	int (*stage2)();
++	int (*stage2)(int (*)(int,char **,char **), int, char **);
+ 	__asm__ ( "" : "=r"(stage2) : "0"(libc_start_main_stage2) : "memory" );
+ 	return stage2(main, argc, argv);
+ }
+-- 
+2.18.1
+
+
+From 9dd19122565c70bc6e0fff35724c91a61209a629 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 12:47:26 -0400
+Subject: [PATCH 30/46] further optimize getc/putc when locking is needed
+
+check whether the lock is free before loading the calling thread's
+tid. if so, just use a dummy tid value that cannot compare equal to
+any actual thread id (because it's one bit wider). this also avoids
+the need to save the tid and pass it to locking_getc or locking_putc,
+reducing register pressure.
+
+this change might slightly hurt the case where the caller already
+holds the lock, but it does not affect the single-threaded case, and
+may significantly improve the multi-threaded case, especially on archs
+where loading the thread pointer is disproportionately expensive like
+early mips and arm ISA levels. but even on i386 it helps, at least on
+some machines; I measured roughly a 10-15% improvement.
+---
+ src/stdio/getc.h | 10 +++++-----
+ src/stdio/putc.h | 10 +++++-----
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/src/stdio/getc.h b/src/stdio/getc.h
+index 0657ab6f..e24f9905 100644
+--- a/src/stdio/getc.h
++++ b/src/stdio/getc.h
+@@ -4,9 +4,9 @@
+ #ifdef __GNUC__
+ __attribute__((__noinline__))
+ #endif
+-static int locking_getc(FILE *f, int tid)
++static int locking_getc(FILE *f)
+ {
+-	if (a_cas(&f->lock, 0, tid)) __lockfile(f);
++	if (a_cas(&f->lock, 0, MAYBE_WAITERS-1)) __lockfile(f);
+ 	int c = getc_unlocked(f);
+ 	if (a_swap(&f->lock, 0) & MAYBE_WAITERS)
+ 		__wake(&f->lock, 1, 1);
+@@ -15,8 +15,8 @@ static int locking_getc(FILE *f, int tid)
+ 
+ static inline int do_getc(FILE *f)
+ {
+-	int tid, l = f->lock;
+-	if (l < 0 || (l & ~MAYBE_WAITERS) == (tid=__pthread_self()->tid))
++	int l = f->lock;
++	if (l < 0 || l && (l & ~MAYBE_WAITERS) == __pthread_self()->tid)
+ 		return getc_unlocked(f);
+-	return locking_getc(f, tid);
++	return locking_getc(f);
+ }
+diff --git a/src/stdio/putc.h b/src/stdio/putc.h
+index a37937e8..2014c4ec 100644
+--- a/src/stdio/putc.h
++++ b/src/stdio/putc.h
+@@ -4,9 +4,9 @@
+ #ifdef __GNUC__
+ __attribute__((__noinline__))
+ #endif
+-static int locking_putc(int c, FILE *f, int tid)
++static int locking_putc(int c, FILE *f)
+ {
+-	if (a_cas(&f->lock, 0, tid)) __lockfile(f);
++	if (a_cas(&f->lock, 0, MAYBE_WAITERS-1)) __lockfile(f);
+ 	c = putc_unlocked(c, f);
+ 	if (a_swap(&f->lock, 0) & MAYBE_WAITERS)
+ 		__wake(&f->lock, 1, 1);
+@@ -15,8 +15,8 @@ static int locking_putc(int c, FILE *f, int tid)
+ 
+ static inline int do_putc(int c, FILE *f)
+ {
+-	int tid, l = f->lock;
+-	if (l < 0 || (l & ~MAYBE_WAITERS) == (tid=__pthread_self()->tid))
++	int l = f->lock;
++	if (l < 0 || l && (l & ~MAYBE_WAITERS) == __pthread_self()->tid)
+ 		return putc_unlocked(c, f);
+-	return locking_putc(c, f, tid);
++	return locking_putc(c, f);
+ }
+-- 
+2.18.1
+
+
+From a21a6092cfc0c7e7cb8c0273e5f94d54c0e0eabd Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 13:33:11 -0400
+Subject: [PATCH 31/46] fix wrong result for putc variants due to operator
+ precedence
+
+the internal putc_unlocked macro was wrongly returning a meaningless
+boolean result rather than the written character or EOF.
+
+bug was found by reading (very surprising) asm.
+---
+ src/internal/stdio_impl.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/internal/stdio_impl.h b/src/internal/stdio_impl.h
+index ab34da2a..44497344 100644
+--- a/src/internal/stdio_impl.h
++++ b/src/internal/stdio_impl.h
+@@ -105,7 +105,7 @@ hidden void __getopt_msg(const char *, const char *, const char *, size_t);
+ 	( ((f)->rpos != (f)->rend) ? *(f)->rpos++ : __uflow((f)) )
+ 
+ #define putc_unlocked(c, f) \
+-	( ((unsigned char)(c)!=(f)->lbf && (f)->wpos!=(f)->wend) \
++	( (((unsigned char)(c)!=(f)->lbf && (f)->wpos!=(f)->wend)) \
+ 	? *(f)->wpos++ = (c) : __overflow((f),(c)) )
+ 
+ /* Caller-allocated FILE * operations */
+-- 
+2.18.1
+
+
+From d8870dcf385a75ae8df2f8bb5bd5ee59525ed348 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 13:37:05 -0400
+Subject: [PATCH 32/46] optimize internal putc_unlocked macro used in putc
+
+to check whether flush due to line buffering is needed, the int-type
+character argument must be truncated to unsigned char for comparison.
+if the original value is subsequently passed to __overflow, it must be
+preserved, adding to register pressure. since it doesn't matter,
+truncate all uses so the original value is no longer live.
+---
+ src/internal/stdio_impl.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/internal/stdio_impl.h b/src/internal/stdio_impl.h
+index 44497344..055ef718 100644
+--- a/src/internal/stdio_impl.h
++++ b/src/internal/stdio_impl.h
+@@ -106,7 +106,8 @@ hidden void __getopt_msg(const char *, const char *, const char *, size_t);
+ 
+ #define putc_unlocked(c, f) \
+ 	( (((unsigned char)(c)!=(f)->lbf && (f)->wpos!=(f)->wend)) \
+-	? *(f)->wpos++ = (c) : __overflow((f),(c)) )
++	? *(f)->wpos++ = (unsigned char)(c) \
++	: __overflow((f),(unsigned char)(c)) )
+ 
+ /* Caller-allocated FILE * operations */
+ hidden FILE *__fopen_rb_ca(const char *, FILE *, unsigned char *, size_t);
+-- 
+2.18.1
+
+
+From 8084d6ab57cdb0b8f328d3cdbad3b9d09eaaee04 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 18 Oct 2018 13:53:44 -0400
+Subject: [PATCH 33/46] adjust types in FILE struct to make line buffering
+ check less expensive
+
+the choice of signed char for lbf was a theoretically space-saving
+hack that was not helping, and was unwantedly expensive. while
+comparing bytes against a byte-sized member sounds easy, the trick
+here was that the byte to be compared was unsigned while the lbf
+member was signed, making it possible to set lbf negative to disable
+line buffering. however, this imposed a requirement to promote both
+operands, zero-extending one and sign-extending the other, in order to
+compare them.
+
+to fix this, repurpose the waiters count slot (unused since commit
+c21f750727515602a9e84f2a190ee8a0a2aeb2a1). while we're at it, switch
+mode (orientation) from signed char to int as well. this makes no
+semantic difference (its only possible values are -1, 0, and 1) but it
+might help on archs where byte access is awkward.
+---
+ src/internal/stdio_impl.h | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/src/internal/stdio_impl.h b/src/internal/stdio_impl.h
+index 055ef718..d7398f59 100644
+--- a/src/internal/stdio_impl.h
++++ b/src/internal/stdio_impl.h
+@@ -34,11 +34,9 @@ struct _IO_FILE {
+ 	int fd;
+ 	int pipe_pid;
+ 	long lockcount;
+-	short dummy3;
+-	signed char mode;
+-	signed char lbf;
++	int mode;
+ 	volatile int lock;
+-	volatile int waiters;
++	int lbf;
+ 	void *cookie;
+ 	off_t off;
+ 	char *getln_buf;
+-- 
+2.18.1
+
+
+From d88e5dfa8b989dafff4b748bfb3cba3512c8482e Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Sat, 20 Oct 2018 21:54:20 -0400
+Subject: [PATCH 34/46] adapt setlocale to support possibility of failure
+
+introduce a new LOC_MAP_FAILED sentinel for errors, since null
+pointers for a category's locale map indicate the C locale. at this
+time, __get_locale does not fail, so there should be no functional
+change by this commit.
+---
+ src/internal/locale_impl.h |  2 ++
+ src/locale/setlocale.c     | 32 ++++++++++++++++++++------------
+ 2 files changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/src/internal/locale_impl.h b/src/internal/locale_impl.h
+index 0b5e00cf..741a71c4 100644
+--- a/src/internal/locale_impl.h
++++ b/src/internal/locale_impl.h
+@@ -27,6 +27,8 @@ hidden const char *__lctrans_impl(const char *, const struct __locale_map *);
+ hidden int __loc_is_allocated(locale_t);
+ hidden char *__gettextdomain(void);
+ 
++#define LOC_MAP_FAILED ((const struct __locale_map *)-1)
++
+ #define LCTRANS(msg, lc, loc) __lctrans(msg, (loc)->cat[(lc)])
+ #define LCTRANS_CUR(msg) __lctrans_cur(msg)
+ 
+diff --git a/src/locale/setlocale.c b/src/locale/setlocale.c
+index 11d823ce..637e7aa0 100644
+--- a/src/locale/setlocale.c
++++ b/src/locale/setlocale.c
+@@ -7,19 +7,10 @@
+ 
+ static char buf[LC_ALL*(LOCALE_NAME_MAX+1)];
+ 
+-static char *setlocale_one_unlocked(int cat, const char *name)
+-{
+-	const struct __locale_map *lm;
+-
+-	if (name) libc.global_locale.cat[cat] = lm = __get_locale(cat, name);
+-	else lm = libc.global_locale.cat[cat];
+-
+-	return lm ? (char *)lm->name : "C";
+-}
+-
+ char *setlocale(int cat, const char *name)
+ {
+ 	static volatile int lock[1];
++	const struct __locale_map *lm;
+ 
+ 	if ((unsigned)cat > LC_ALL) return 0;
+ 
+@@ -33,6 +24,7 @@ char *setlocale(int cat, const char *name)
+ 	if (cat == LC_ALL) {
+ 		int i;
+ 		if (name) {
++			struct __locale_struct tmp_locale;
+ 			char part[LOCALE_NAME_MAX+1] = "C.UTF-8";
+ 			const char *p = name;
+ 			for (i=0; i<LC_ALL; i++) {
+@@ -42,8 +34,14 @@ char *setlocale(int cat, const char *name)
+ 					part[z-p] = 0;
+ 					if (*z) p = z+1;
+ 				}
+-				setlocale_one_unlocked(i, part);
++				lm = __get_locale(i, name);
++				if (lm == LOC_MAP_FAILED) {
++					UNLOCK(lock);
++					return 0;
++				}
++				tmp_locale.cat[i] = lm;
+ 			}
++			libc.global_locale = tmp_locale;
+ 		}
+ 		char *s = buf;
+ 		const char *part;
+@@ -63,7 +61,17 @@ char *setlocale(int cat, const char *name)
+ 		return same==LC_ALL ? (char *)part : buf;
+ 	}
+ 
+-	char *ret = setlocale_one_unlocked(cat, name);
++	if (name) {
++		lm = __get_locale(cat, name);
++		if (lm == LOC_MAP_FAILED) {
++			UNLOCK(lock);
++			return 0;
++		}
++		libc.global_locale.cat[cat] = lm;
++	} else {
++		lm = libc.global_locale.cat[cat];
++	}
++	char *ret = lm ? (char *)lm->name : "C";
+ 
+ 	UNLOCK(lock);
+ 
+-- 
+2.18.1
+
+
+From 6753fb68b84cd7155d8b9a3a3bc3eff1ab6a8030 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Sat, 20 Oct 2018 22:44:34 -0400
+Subject: [PATCH 35/46] remove volatile qualification from category pointers in
+ __locale_struct
+
+commit 63c188ec42e76ff768e81f6b65b11c68fc43351e missed making this
+change when switching from atomics to locking for modification of the
+global locale, leaving access to locale structures unnecessarily
+burdened with the restrictions of volatile.
+
+the volatile qualification was originally added in commit
+56fbaa3bbe73f12af2bfbbcf2adb196e6f9fe264.
+---
+ src/internal/libc.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/internal/libc.h b/src/internal/libc.h
+index 10bd66bd..ac97dc7e 100644
+--- a/src/internal/libc.h
++++ b/src/internal/libc.h
+@@ -8,7 +8,7 @@
+ struct __locale_map;
+ 
+ struct __locale_struct {
+-	const struct __locale_map *volatile cat[6];
++	const struct __locale_map *cat[6];
+ };
+ 
+ struct tls_module {
+-- 
+2.18.1
+
+
+From 74e704006a0004058fc38806a19c1552b1e2463d Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Sun, 21 Oct 2018 01:09:20 -0400
+Subject: [PATCH 36/46] simplify newlocale and allow failure for explicit
+ locale names
+
+unify the code paths for allocated and non-allocated locale objects,
+always using a tmp object. this is necessary to avoid clobbering the
+base locale object too soon if we allow for the possibility that
+looking up an explicitly requested locale name may fail, and makes the
+code simpler and cleaner anyway.
+
+eliminate the complex and fragile logic for checking whether one of
+the non-allocated locale objects can be used for the result, and
+instead just memcmp against each of them.
+---
+ src/locale/newlocale.c | 37 ++++++++++++++-----------------------
+ 1 file changed, 14 insertions(+), 23 deletions(-)
+
+diff --git a/src/locale/newlocale.c b/src/locale/newlocale.c
+index 8fb006a7..68574605 100644
+--- a/src/locale/newlocale.c
++++ b/src/locale/newlocale.c
+@@ -9,37 +9,28 @@ int __loc_is_allocated(locale_t loc)
+ 
+ locale_t __newlocale(int mask, const char *name, locale_t loc)
+ {
+-	int i, j;
+ 	struct __locale_struct tmp;
+-	const struct __locale_map *lm;
++
++	for (int i=0; i<LC_ALL; i++) {
++		tmp.cat[i] = (!(mask & (1<<i)) && loc) ? loc->cat[i] :
++			__get_locale(i, (mask & (1<<i)) ? name : "");
++		if (tmp.cat[i] == LOC_MAP_FAILED)
++			return 0;
++	}
+ 
+ 	/* For locales with allocated storage, modify in-place. */
+ 	if (__loc_is_allocated(loc)) {
+-		for (i=0; i<LC_ALL; i++)
+-			if (mask & (1<<i))
+-				loc->cat[i] = __get_locale(i, name);
++		*loc = tmp;
+ 		return loc;
+ 	}
+ 
+-	/* Otherwise, build a temporary locale object, which will only
+-	 * be instantiated in allocated storage if it does not match
+-	 * one of the built-in static locales. This makes the common
+-	 * usage case for newlocale, getting a C locale with predictable
+-	 * behavior, very fast, and more importantly, fail-safe. */
+-	for (j=i=0; i<LC_ALL; i++) {
+-		if (loc && !(mask & (1<<i)))
+-			lm = loc->cat[i];
+-		else
+-			lm = __get_locale(i, mask & (1<<i) ? name : "");
+-		if (lm) j++;
+-		tmp.cat[i] = lm;
+-	}
+-
+-	if (!j)
+-		return C_LOCALE;
+-	if (j==1 && tmp.cat[LC_CTYPE]==&__c_dot_utf8)
+-		return UTF8_LOCALE;
++	/* Otherwise, first see if we can use one of the builtin locales.
++	 * This makes the common usage case for newlocale, getting a C locale
++	 * with predictable behavior, very fast, and more importantly, fail-safe. */
++	if (!memcmp(&tmp, C_LOCALE, sizeof tmp)) return C_LOCALE;
++	if (!memcmp(&tmp, UTF8_LOCALE, sizeof tmp)) return UTF8_LOCALE;
+ 
++	/* If no builtin locale matched, attempt to allocate and copy. */
+ 	if ((loc = malloc(sizeof *loc))) *loc = tmp;
+ 
+ 	return loc;
+-- 
+2.18.1
+
+
+From 5af1f5942b2068d99182991dc212bdb3f5e9973d Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 22 Oct 2018 00:22:33 -0400
+Subject: [PATCH 37/46] make the default locale (& a variant) failure-free
+ cases for newlocale
+
+commit aeeac9ca5490d7d90fe061ab72da446c01ddf746 introduced fail-safe
+invariants that creating a locale_t object for the C locale or C.UTF-8
+locale will always succeed. extend the guarantee to also cover the
+following:
+
+- newlocale(LC_ALL_MASK, "", 0)
+- newlocale(LC_ALL_MASK-LC_CTYPE_MASK, "C", 0)
+
+provided that the LANG/LC_* environment variables have not been
+changed by the program. these usages are idiomatic for getting the
+default locale, and for getting a locale that behaves as the C locale
+except for honoring the default locale's character encoding.
+---
+ src/locale/newlocale.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/locale/newlocale.c b/src/locale/newlocale.c
+index 68574605..d20a8489 100644
+--- a/src/locale/newlocale.c
++++ b/src/locale/newlocale.c
+@@ -1,10 +1,22 @@
+ #include <stdlib.h>
+ #include <string.h>
++#include <pthread.h>
+ #include "locale_impl.h"
+ 
++static pthread_once_t default_locale_once;
++static struct __locale_struct default_locale, default_ctype_locale;
++
++static void default_locale_init(void)
++{
++	for (int i=0; i<LC_ALL; i++)
++		default_locale.cat[i] = __get_locale(i, "");
++	default_ctype_locale.cat[LC_CTYPE] = default_locale.cat[LC_CTYPE];
++}
++
+ int __loc_is_allocated(locale_t loc)
+ {
+-	return loc && loc != C_LOCALE && loc != UTF8_LOCALE;
++	return loc && loc != C_LOCALE && loc != UTF8_LOCALE
++		&& loc != &default_locale && loc != &default_ctype_locale;
+ }
+ 
+ locale_t __newlocale(int mask, const char *name, locale_t loc)
+@@ -30,6 +42,13 @@ locale_t __newlocale(int mask, const char *name, locale_t loc)
+ 	if (!memcmp(&tmp, C_LOCALE, sizeof tmp)) return C_LOCALE;
+ 	if (!memcmp(&tmp, UTF8_LOCALE, sizeof tmp)) return UTF8_LOCALE;
+ 
++	/* And provide builtins for the initial default locale, and a
++	 * variant of the C locale honoring the default locale's encoding. */
++	pthread_once(&default_locale_once, default_locale_init);
++	if (!memcmp(&tmp, &default_locale, sizeof tmp)) return &default_locale;
++	if (!memcmp(&tmp, &default_ctype_locale, sizeof tmp))
++		return &default_ctype_locale;
++
+ 	/* If no builtin locale matched, attempt to allocate and copy. */
+ 	if ((loc = malloc(sizeof *loc))) *loc = tmp;
+ 
+-- 
+2.18.1
+
+
+From 1b52863e244ecee5b5935b6d36bb9e6efe84c035 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 22 Oct 2018 21:37:50 -0400
+Subject: [PATCH 38/46] don't omit setting errno in internal __map_file
+ function
+
+a caller needs the reason for open (or fstat, albeit unlikely) failure
+if it's going to make decisions about continuing a path search or
+similar.
+---
+ src/time/__map_file.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/time/__map_file.c b/src/time/__map_file.c
+index 750d1958..9d376222 100644
+--- a/src/time/__map_file.c
++++ b/src/time/__map_file.c
+@@ -7,9 +7,9 @@ const char unsigned *__map_file(const char *pathname, size_t *size)
+ {
+ 	struct stat st;
+ 	const unsigned char *map = MAP_FAILED;
+-	int fd = __sys_open(pathname, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
++	int fd = sys_open(pathname, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+ 	if (fd < 0) return 0;
+-	if (!__syscall(SYS_fstat, fd, &st)) {
++	if (!syscall(SYS_fstat, fd, &st)) {
+ 		map = __mmap(0, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+ 		*size = st.st_size;
+ 	}
+-- 
+2.18.1
+
+
+From 8f5a820d147da36bcdbddd201b35d293699dacd8 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 2 Nov 2018 12:01:37 -0400
+Subject: [PATCH 39/46] fix spuriously slow check in twoway strstr/memmem cores
+
+mem0 && mem && ... is redundant since mem can only be nonzero when
+mem0 is nonzero.
+---
+ src/string/memmem.c | 2 +-
+ src/string/strstr.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/string/memmem.c b/src/string/memmem.c
+index 54a66e46..ce3cd190 100644
+--- a/src/string/memmem.c
++++ b/src/string/memmem.c
+@@ -100,7 +100,7 @@ static char *twoway_memmem(const unsigned char *h, const unsigned char *z, const
+ 		if (BITOP(byteset, h[l-1], &)) {
+ 			k = l-shift[h[l-1]];
+ 			if (k) {
+-				if (mem0 && mem && k < p) k = l-p;
++				if (mem && k < p) k = l-p;
+ 				h += k;
+ 				mem = 0;
+ 				continue;
+diff --git a/src/string/strstr.c b/src/string/strstr.c
+index cd069127..c80e9caf 100644
+--- a/src/string/strstr.c
++++ b/src/string/strstr.c
+@@ -110,7 +110,7 @@ static char *twoway_strstr(const unsigned char *h, const unsigned char *n)
+ 			k = l-shift[h[l-1]];
+ 			//printf("adv by %zu (on %c) at [%s] (%zu;l=%zu)\n", k, h[l-1], h, shift[h[l-1]], l);
+ 			if (k) {
+-				if (mem0 && mem && k < p) k = l-p;
++				if (mem && k < p) k = l-p;
+ 				h += k;
+ 				mem = 0;
+ 				continue;
+-- 
+2.18.1
+
+
+From 0239cd0681e889a269fb7691f60e81ef8d081e6b Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 2 Nov 2018 12:04:41 -0400
+Subject: [PATCH 40/46] remove commented-out debug printf from strstr
+
+this was leftover from before the initial commit.
+---
+ src/string/strstr.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/string/strstr.c b/src/string/strstr.c
+index c80e9caf..c7d66682 100644
+--- a/src/string/strstr.c
++++ b/src/string/strstr.c
+@@ -108,7 +108,6 @@ static char *twoway_strstr(const unsigned char *h, const unsigned char *n)
+ 		/* Check last byte first; advance by shift on mismatch */
+ 		if (BITOP(byteset, h[l-1], &)) {
+ 			k = l-shift[h[l-1]];
+-			//printf("adv by %zu (on %c) at [%s] (%zu;l=%zu)\n", k, h[l-1], h, shift[h[l-1]], l);
+ 			if (k) {
+ 				if (mem && k < p) k = l-p;
+ 				h += k;
+-- 
+2.18.1
+
+
+From 00bd3b7d3006c5d350959c994fa65358bf65e6a2 Mon Sep 17 00:00:00 2001
+From: Alexander Monakov <amonakov@ispras.ru>
+Date: Sun, 21 Oct 2018 00:27:44 +0300
+Subject: [PATCH 41/46] __libc_start_main: slightly simplify stage2 pointer
+ setup
+
+Use "+r" in the asm instead of implementing a non-transparent copy by
+applying "0" constraint to the source value. Introduce a typedef for
+the function type to avoid spelling it out twice.
+---
+ src/env/__libc_start_main.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/env/__libc_start_main.c b/src/env/__libc_start_main.c
+index b4965d7f..7c95f822 100644
+--- a/src/env/__libc_start_main.c
++++ b/src/env/__libc_start_main.c
+@@ -66,7 +66,8 @@ static void libc_start_init(void)
+ 
+ weak_alias(libc_start_init, __libc_start_init);
+ 
+-static int libc_start_main_stage2(int (*)(int,char **,char **), int, char **);
++typedef int lsm2_fn(int (*)(int,char **,char **), int, char **);
++static lsm2_fn libc_start_main_stage2;
+ 
+ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ {
+@@ -79,8 +80,8 @@ int __libc_start_main(int (*main)(int,char **,char **), int argc, char **argv)
+ 
+ 	/* Barrier against hoisting application code or anything using ssp
+ 	 * or thread pointer prior to its initialization above. */
+-	int (*stage2)(int (*)(int,char **,char **), int, char **);
+-	__asm__ ( "" : "=r"(stage2) : "0"(libc_start_main_stage2) : "memory" );
++	lsm2_fn *stage2 = libc_start_main_stage2;
++	__asm__ ( "" : "+r"(stage2) : : "memory" );
+ 	return stage2(main, argc, argv);
+ }
+ 
+-- 
+2.18.1
+
+
+From 4a086030264f5cf423ea76453ef721e2c8e2e093 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 2 Nov 2018 12:31:19 -0400
+Subject: [PATCH 42/46] fix deadlock and buffered data loss race in fclose
+
+fflush(NULL) and __stdio_exit lock individual FILEs while holding the
+open file list lock to walk the list. since fclose first locked the
+FILE to be closed, then the ofl lock, it could deadlock with these
+functions.
+
+also, because fclose removed the FILE to be closed from the open file
+list before flushing and closing it, a concurrent fclose or exit could
+complete successfully before fclose flushed the FILE it was closing,
+resulting in data loss.
+
+reorder the body of fclose to first flush and close the file, then
+remove it from the open file list only after unlocking it. this
+creates a window where consumers of the open file list can see dead
+FILE objects, but in the absence of undefined behavior on the part of
+the application, such objects will be in an inactive-buffer state and
+processing them will have no side effects.
+
+__unlist_locked_file is also moved so that it's performed only for
+non-permanent files. this change is not necessary, but preserves
+consistency (and thereby provides safety/hardening) in the case where
+an application uses one of the standard streams after closing it while
+holding an explicit lock on it. such usage is of course undefined
+behavior.
+---
+ src/stdio/fclose.c | 32 +++++++++++++++++++-------------
+ 1 file changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/src/stdio/fclose.c b/src/stdio/fclose.c
+index 889b96d2..d594532b 100644
+--- a/src/stdio/fclose.c
++++ b/src/stdio/fclose.c
+@@ -7,26 +7,32 @@ weak_alias(dummy, __unlist_locked_file);
+ int fclose(FILE *f)
+ {
+ 	int r;
+-	int perm;
+ 	
+ 	FLOCK(f);
++	r = fflush(f);
++	r |= f->close(f);
++	FUNLOCK(f);
+ 
+-	__unlist_locked_file(f);
++	/* Past this point, f is closed and any further explict access
++	 * to it is undefined. However, it still exists as an entry in
++	 * the open file list and possibly in the thread's locked files
++	 * list, if it was closed while explicitly locked. Functions
++	 * which process these lists must tolerate dead FILE objects
++	 * (which necessarily have inactive buffer pointers) without
++	 * producing any side effects. */
+ 
+-	if (!(perm = f->flags & F_PERM)) {
+-		FILE **head = __ofl_lock();
+-		if (f->prev) f->prev->next = f->next;
+-		if (f->next) f->next->prev = f->prev;
+-		if (*head == f) *head = f->next;
+-		__ofl_unlock();
+-	}
++	if (f->flags & F_PERM) return r;
+ 
+-	r = fflush(f);
+-	r |= f->close(f);
++	__unlist_locked_file(f);
++
++	FILE **head = __ofl_lock();
++	if (f->prev) f->prev->next = f->next;
++	if (f->next) f->next->prev = f->prev;
++	if (*head == f) *head = f->next;
++	__ofl_unlock();
+ 
+ 	free(f->getln_buf);
+-	if (!perm) free(f);
+-	else FUNLOCK(f);
++	free(f);
+ 
+ 	return r;
+ }
+-- 
+2.18.1
+
+
+From 79f653c6bc2881dd6855299c908a442f56cb7c2b Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 2 Nov 2018 12:52:56 -0400
+Subject: [PATCH 43/46] fix failure to flush stderr when fflush(0) is called
+
+commit ddc947eda311331959c73dbc4491afcfe2326346 fixed the
+corresponding bug for exit which was introduced when commit
+0b80a7b0404b6e49b0b724e3e3fe0ed5af3b08ef added support for
+caller-provided buffers, making it possible for stderr to be a
+buffered stream.
+---
+ src/stdio/fflush.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/stdio/fflush.c b/src/stdio/fflush.c
+index 02dae27a..b0094376 100644
+--- a/src/stdio/fflush.c
++++ b/src/stdio/fflush.c
+@@ -3,11 +3,14 @@
+ /* stdout.c will override this if linked */
+ static FILE *volatile dummy = 0;
+ weak_alias(dummy, __stdout_used);
++weak_alias(dummy, __stderr_used);
+ 
+ int fflush(FILE *f)
+ {
+ 	if (!f) {
+-		int r = __stdout_used ? fflush(__stdout_used) : 0;
++		int r = 0;
++		if (__stdout_used) r |= fflush(__stdout_used);
++		if (__stderr_used) r |= fflush(__stderr_used);
+ 
+ 		for (f=*__ofl_lock(); f; f=f->next) {
+ 			FLOCK(f);
+-- 
+2.18.1
+
+
+From 04e18b61dfde85e34ddea15e4a7d49f24c47bb73 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Fri, 2 Nov 2018 20:40:24 -0400
+Subject: [PATCH 44/46] fix regression in setlocale for LC_ALL with
+ per-category setting
+
+commit d88e5dfa8b989dafff4b748bfb3cba3512c8482e inadvertently changed
+the argument pased to __get_locale from part (the current ;-delimited
+component) to name (the full string).
+---
+ src/locale/setlocale.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/locale/setlocale.c b/src/locale/setlocale.c
+index 637e7aa0..2bc7b500 100644
+--- a/src/locale/setlocale.c
++++ b/src/locale/setlocale.c
+@@ -34,7 +34,7 @@ char *setlocale(int cat, const char *name)
+ 					part[z-p] = 0;
+ 					if (*z) p = z+1;
+ 				}
+-				lm = __get_locale(i, name);
++				lm = __get_locale(i, part);
+ 				if (lm == LOC_MAP_FAILED) {
+ 					UNLOCK(lock);
+ 					return 0;
+-- 
+2.18.1
+
+
+From 122d67f846cb0be2c9e1c3880db9eb9545bbe38c Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Thu, 8 Nov 2018 15:00:02 -0500
+Subject: [PATCH 45/46] optimize two-way strstr and memmem bad character shift
+
+first, the condition (mem && k < p) is redundant, because mem being
+nonzero implies the needle is periodic with period exactly p, in which
+case any byte that appears in the needle must appear in the last p
+bytes of the needle, bounding the shift (k) by p.
+
+second, the whole point of replacing the shift k by mem (=l-p) is to
+prevent shifting by less than mem when discarding the memory on shift,
+in which case linear time could not be guaranteed. but as written, the
+check also replaced shifts greater than mem by mem, reducing the
+benefit of the shift. there is no possible benefit to this reduction of
+the shift; since mem is being cleared, the full shift is valid and
+more optimal. so only replace the shift by mem when it would be less
+than mem.
+---
+ src/string/memmem.c | 2 +-
+ src/string/strstr.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/string/memmem.c b/src/string/memmem.c
+index ce3cd190..58a21fcd 100644
+--- a/src/string/memmem.c
++++ b/src/string/memmem.c
+@@ -100,7 +100,7 @@ static char *twoway_memmem(const unsigned char *h, const unsigned char *z, const
+ 		if (BITOP(byteset, h[l-1], &)) {
+ 			k = l-shift[h[l-1]];
+ 			if (k) {
+-				if (mem && k < p) k = l-p;
++				if (k < mem) k = mem;
+ 				h += k;
+ 				mem = 0;
+ 				continue;
+diff --git a/src/string/strstr.c b/src/string/strstr.c
+index c7d66682..55ba1c7b 100644
+--- a/src/string/strstr.c
++++ b/src/string/strstr.c
+@@ -109,7 +109,7 @@ static char *twoway_strstr(const unsigned char *h, const unsigned char *n)
+ 		if (BITOP(byteset, h[l-1], &)) {
+ 			k = l-shift[h[l-1]];
+ 			if (k) {
+-				if (mem && k < p) k = l-p;
++				if (k < mem) k = mem;
+ 				h += k;
+ 				mem = 0;
+ 				continue;
+-- 
+2.18.1
+
+
+From 39ef612aa193cc6e954ac5a01574300ccd4b7ef9 Mon Sep 17 00:00:00 2001
+From: Rich Felker <dalias@aerifal.cx>
+Date: Mon, 19 Nov 2018 13:11:56 -0500
+Subject: [PATCH 46/46] fix regression in access to optopt object
+
+commit b9410061e2ad6fe91bb3910c3adc7d4a315b7ce9 inadvertently omitted
+optopt from the "dynamic list", causing it to be split into separate
+objects that don't share their value if the main program contains a
+copy relocation for it (for non-PIE executables that access it, and
+some PIE ones, depending on arch and toolchain versions/options).
+---
+ dynamic.list | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dynamic.list b/dynamic.list
+index 686f8eb4..ee0d363b 100644
+--- a/dynamic.list
++++ b/dynamic.list
+@@ -28,6 +28,7 @@ __signgam;
+ optarg;
+ optind;
+ opterr;
++optopt;
+ optreset;
+ __optreset;
+ 
+-- 
+2.18.1
+

@@ -1,0 +1,21 @@
+diff --git a/libatomic/testsuite/lib/libatomic.exp b/libatomic/testsuite/lib/libatomic.exp
+index 38f3e5673e2..02ec2e8b48a 100644
+--- a/libatomic/testsuite/lib/libatomic.exp
++++ b/libatomic/testsuite/lib/libatomic.exp
+@@ -77,6 +77,7 @@ proc libatomic_init { args } {
+     global ALWAYS_CFLAGS
+     global CFLAGS
+     global TOOL_EXECUTABLE TOOL_OPTIONS
++    global BUILD_CC
+     global GCC_UNDER_TEST
+     global TESTING_IN_BUILD_TREE
+     global target_triplet
+@@ -92,6 +93,8 @@ proc libatomic_init { args } {
+     if ![info exists GCC_UNDER_TEST] then {
+ 	if [info exists TOOL_EXECUTABLE] {
+ 	    set GCC_UNDER_TEST $TOOL_EXECUTABLE
++	} elseif [info exists BUILD_CC] {
++	    set GCC_UNDER_TEST $BUILD_CC
+ 	} else {
+ 	    set GCC_UNDER_TEST "[find_gcc]"
+ 	}

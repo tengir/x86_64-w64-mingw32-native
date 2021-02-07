@@ -1,0 +1,28 @@
+From 020ccd0e2c77ded655bab68c2b3a0d3dc1151aab Mon Sep 17 00:00:00 2001
+From: Stefan O'Rear <sorear@fastmail.com>
+Date: Thu, 3 Sep 2020 03:17:45 -0400
+Subject: [PATCH 01/14] Remove ARMSUBARCH relic from configure
+
+---
+ configure | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/configure b/configure
+index 947adf41..49a7b403 100755
+--- a/configure
++++ b/configure
+@@ -725,11 +725,6 @@ fi
+ test "$SUBARCH" \
+ && printf "configured for %s variant: %s\n" "$ARCH" "$ARCH$SUBARCH"
+ 
+-case "$ARCH$SUBARCH" in
+-arm) ASMSUBARCH=el ;;
+-*) ASMSUBARCH=$SUBARCH ;;
+-esac
+-
+ #
+ # Some archs (powerpc) have different possible long double formats
+ # that the compiler can be configured for. The logic for whether this
+-- 
+2.25.4
+

@@ -1,0 +1,63 @@
+diff -ur a/config/cet.m4 b/config/cet.m4
+--- a/config/cet.m4	2020-05-07 16:34:06.030609892 -0500
++++ b/config/cet.m4	2020-05-07 16:34:14.174781233 -0500
+@@ -60,7 +60,7 @@
+ 
+ case "$host" in
+   i[[34567]]86-*-linux* | x86_64-*-linux*)
+-    may_have_cet=yes
++    may_have_cet=no
+     save_CFLAGS="$CFLAGS"
+     CFLAGS="$CFLAGS -fcf-protection"
+     case "$enable_cet" in
+@@ -106,7 +106,7 @@
+   # Check whether -fcf-protection=none -Wl,-z,ibt,-z,shstk work.
+   AC_TRY_LINK(
+     [],[return 0;],
+-    [may_have_cet=yes],
++    [may_have_cet=no],
+     [may_have_cet=no])
+ fi
+ 
+diff -ur a/libiberty/configure b/libiberty/configure
+--- a/libiberty/configure	2020-05-07 16:34:07.278636152 -0500
++++ b/libiberty/configure	2020-05-07 16:34:14.038778370 -0500
+@@ -5285,7 +5285,7 @@
+ 
+ case "$host" in
+   i[34567]86-*-linux* | x86_64-*-linux*)
+-    may_have_cet=yes
++    may_have_cet=no
+     save_CFLAGS="$CFLAGS"
+     CFLAGS="$CFLAGS -fcf-protection"
+     case "$enable_cet" in
+@@ -5366,7 +5366,7 @@
+ }
+ _ACEOF
+ if ac_fn_c_try_link "$LINENO"; then :
+-  may_have_cet=yes
++  may_have_cet=no
+ else
+   may_have_cet=no
+ fi
+diff -ur a/lto-plugin/configure b/lto-plugin/configure
+--- a/lto-plugin/configure	2020-05-07 16:34:07.266635899 -0500
++++ b/lto-plugin/configure	2020-05-07 16:34:14.146780642 -0500
+@@ -5681,7 +5681,7 @@
+ 
+ case "$host" in
+   i[34567]86-*-linux* | x86_64-*-linux*)
+-    may_have_cet=yes
++    may_have_cet=no
+     save_CFLAGS="$CFLAGS"
+     CFLAGS="$CFLAGS -fcf-protection"
+     case "$enable_cet" in
+@@ -5759,7 +5759,7 @@
+ }
+ _ACEOF
+ if ac_fn_c_try_link "$LINENO"; then :
+-  may_have_cet=yes
++  may_have_cet=no
+ else
+   may_have_cet=no
+ fi
